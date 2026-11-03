@@ -961,12 +961,45 @@ async function renderPdf(paper) {
   const old = state.pdf;
   state.pdf = null;  // not used while it's being destroyed (a resize re-fits from it)
   if (old) await old.destroy();
-  state.pdf = await pdfjsLib.getDocument({
-    // The file's hash in the URL: a paper updated to a newer version isn't shown from the cache.
-    url: `/api/papers/${encodeURIComponent(paper.id)}/pdf?sha=${paper.pdf_sha256 || ""}`, worker: pdfWorker,
-  }).promise;
+  // The file's hash in the URL: a paper updated to a newer version isn't shown from the cache.
+  const url = `/api/papers/${encodeURIComponent(paper.id)}/pdf?sha=${paper.pdf_sha256 || ""}`;
+  const cached = await cachedPdf(url);
+  state.pdf = await pdfjsLib.getDocument(cached ? { data: cached, worker: pdfWorker } : { url, worker: pdfWorker }).promise;
   if (token !== renderToken) return;
   layoutPages(token);
+  if (!cached && paper.pdf_sha256) cachePdf(url, paper.pdf_sha256, state.pdf);
+}
+
+// PDFs kept in the browser (Cache Storage), so a paper opened again doesn't wait for its download.
+// On Vercel the file comes from arXiv, which doesn't let the browser's HTTP cache keep it. Keyed by
+// the file's hash, so they never go stale; the least recently opened go first past PDF_CACHE_SIZE.
+const PDF_CACHE = "pdfs-v1";
+const PDF_CACHE_SIZE = 40;
+
+async function cachedPdf(url) {
+  try {
+    const cache = await caches.open(PDF_CACHE);
+    const hit = await cache.match(url);
+    if (!hit) return null;
+    const data = await hit.arrayBuffer();
+    await cache.delete(url);  // put back last: the most recently opened
+    await cache.put(url, new Response(data, { headers: { "Content-Type": "application/pdf" } }));
+    return new Uint8Array(data);
+  } catch { return null; }  // no Cache Storage (e.g. not https), or it was cleared
+}
+
+// Once pdf.js has the whole file (it streams it in ranges), stores it if it's the pinned version.
+async function cachePdf(url, sha, pdf) {
+  try {
+    const data = await pdf.getData();
+    const hash = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", data)),
+      (b) => b.toString(16).padStart(2, "0")).join("");
+    if (hash !== sha) return;
+    const cache = await caches.open(PDF_CACHE);
+    await cache.put(url, new Response(data, { headers: { "Content-Type": "application/pdf" } }));
+    const keys = await cache.keys();  // oldest first
+    for (const old of keys.slice(0, Math.max(0, keys.length - PDF_CACHE_SIZE))) await cache.delete(old);
+  } catch {}  // the paper was closed (pdf destroyed) or storage is full: not cached this time
 }
 
 async function layoutPages(token) {
