@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import re
+import time
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from urllib.parse import urlparse
@@ -49,7 +50,51 @@ def paper_id_for(source: str) -> tuple[str, str | None]:
 
 
 def pdf_path(paper_id: str):
+    PAPERS_DIR.mkdir(parents=True, exist_ok=True)  # a cache on Vercel: /tmp can be emptied
     return PAPERS_DIR / (paper_id.replace("/", "_") + ".pdf")
+
+
+def pdf_url(paper: dict) -> str:
+    """Where the paper's PDF was downloaded from: for arXiv, the exact version the text came from.
+    (Papers added before that was recorded: their arXiv ID, or their URL if not on arXiv.)"""
+    if paper.get("pdf_url"):
+        return paper["pdf_url"]
+    return paper["source_url"] if paper["id"].startswith("url-") else f"https://arxiv.org/pdf/{paper['id']}"
+
+
+async def ensure_pdf(paper: dict):
+    """The paper's PDF on disk, downloaded again if it's gone (on Vercel, /tmp is only a cache).
+    A download that isn't the file the paper was made from is refused: the stored text, notation
+    and elements describe that file (a web page's PDF can change; an arXiv version doesn't)."""
+    path = pdf_path(paper["id"])
+    if not path.exists():
+        pdf = await download_pdf(pdf_url(paper))
+        if paper.get("pdf_sha256") and hashlib.sha256(pdf).hexdigest() != paper["pdf_sha256"]:
+            raise PaperError(f"The PDF at {pdf_url(paper)} has changed since this paper was added")
+        path.write_bytes(pdf)
+    return path
+
+
+def archived(paper_id: str) -> bool:
+    """An earlier version kept when the paper was updated: its id has the version ("2210.02747v2")."""
+    return parse_arxiv_id(paper_id) is not None and paper_id != parse_arxiv_id(paper_id)
+
+
+LATEST_TTL = 24 * 3600  # seconds between asking arXiv for a paper's latest version
+
+
+async def newer_version(paper: dict) -> int | None:
+    """The latest arXiv version, if it's newer than the paper's."""
+    if not paper.get("arxiv_version") or archived(paper["id"]):
+        return None
+    latest = paper.get("latest_version")
+    if not latest or time.time() - (paper.get("latest_checked_at") or 0) > LATEST_TTL:
+        meta = await arxiv_metadata(paper["id"])
+        latest = meta and meta["version"]
+        if not latest:
+            return None
+        db.set_latest_version(paper["id"], latest)
+    return latest if latest > paper["arxiv_version"] else None
 
 
 async def arxiv_query(params: dict) -> list[dict]:
@@ -63,12 +108,15 @@ async def arxiv_query(params: dict) -> list[dict]:
         arxiv_id = parse_arxiv_id(id_url)
         if not arxiv_id:
             continue
+        version = re.search(r"v(\d+)$", id_url)
         out.append({
             "arxiv_id": arxiv_id,
+            "version": int(version.group(1)) if version else None,  # the latest
             "title": " ".join(entry.findtext("a:title", "", ATOM).split()),
             "authors": [a.findtext("a:name", "", ATOM) for a in entry.findall("a:author", ATOM)],
             "abstract": " ".join(entry.findtext("a:summary", "", ATOM).split()),
             "published": entry.findtext("a:published", "", ATOM)[:10],
+            "updated": entry.findtext("a:updated", "", ATOM)[:10],  # when the latest version came out
             "url": f"https://arxiv.org/abs/{arxiv_id}",
         })
     return out
@@ -203,7 +251,7 @@ def extract_text(pdf_bytes: bytes) -> tuple[str, int, dict]:
     with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
         pages = []
         for i, page in enumerate(doc, start=1):
-            text = page.get_text("text").strip()
+            text = page.get_text("text").replace("\x00", "").strip()  # NULs: extraction noise, and libsql cuts strings at one
             # Rejoin words hyphenated across line breaks.
             text = re.sub(r"(\w)-\n(\w)", r"\1\2", text)
             pages.append(f"[Page {i}]\n{text}")
@@ -228,41 +276,81 @@ async def ingest(source: str, known: dict | None = None) -> dict:
     The stored text is frozen at ingest time, so the paper message sent to the model is
     byte-identical across every conversation about this paper (keeps the prefix cache warm).
     """
+    if stored := db.get_paper(source.strip()):  # by its id, e.g. an archived version ("2210.02747v2")
+        return stored
     paper_id, arxiv_id = paper_id_for(source)
     async with _locks[paper_id]:
         existing = db.get_paper(paper_id)
         if existing:
             return existing
-
-        if arxiv_id:
-            meta = await arxiv_metadata(arxiv_id)
-            if meta is None:
-                raise PaperError(f"arXiv paper {arxiv_id} not found")
-            pdf_url = f"https://arxiv.org/pdf/{arxiv_id}"
-            source_url = meta["url"]
-        else:
-            parsed = urlparse(source.strip())
-            if parsed.scheme not in ("http", "https"):
-                raise PaperError("Paste an arXiv link/ID or a direct PDF URL")
-            meta, pdf_url, source_url = None, source.strip(), source.strip()
-
-        pdf_bytes = await download_pdf(pdf_url)
-        text, num_pages, pdf_meta = await asyncio.to_thread(extract_text, pdf_bytes)
+        paper, pdf_bytes = await _fetch(source, paper_id, arxiv_id, known)
         pdf_path(paper_id).write_bytes(pdf_bytes)
+        db.insert_paper(paper)
+        return db.get_paper(paper_id)
 
-        if meta is None and known and known.get("title"):
-            meta = {"title": known["title"][:300], "authors": known.get("authors") or [],
-                    "abstract": "", "published": known.get("published") or ""}
+
+async def _fetch(source: str, paper_id: str, arxiv_id: str | None, known: dict | None = None) -> tuple[dict, bytes]:
+    """The paper to store (not stored yet), and its PDF. For arXiv, the latest version, pinned:
+    pdf_url names that version, so the same file can be downloaded again."""
+    if arxiv_id:
+        meta = await arxiv_metadata(arxiv_id)
         if meta is None:
-            first_line = next((l for l in text.splitlines()[1:] if len(l.strip()) > 10), source_url)
-            meta = {
-                "title": (pdf_meta.get("title") or first_line).strip()[:300],
-                "authors": [a.strip() for a in (pdf_meta.get("author") or "").split(",") if a.strip()],
-                "abstract": "", "published": "",
-            }
-        db.insert_paper({
-            "id": paper_id, "source_url": source_url, "title": meta["title"],
-            "authors": meta["authors"], "abstract": meta["abstract"],
-            "published": meta["published"], "num_pages": num_pages, "text": text,
-        })
+            raise PaperError(f"arXiv paper {arxiv_id} not found")
+        version = meta["version"]
+        pdf_url = f"https://arxiv.org/pdf/{arxiv_id}" + (f"v{version}" if version else "")
+        source_url = meta["url"]
+    else:
+        parsed = urlparse(source.strip())
+        if parsed.scheme not in ("http", "https"):
+            raise PaperError("Paste an arXiv link/ID or a direct PDF URL")
+        meta, version, pdf_url, source_url = None, None, source.strip(), source.strip()
+
+    pdf_bytes = await download_pdf(pdf_url)
+    text, num_pages, pdf_meta = await asyncio.to_thread(extract_text, pdf_bytes)
+
+    if meta is None and known and known.get("title"):
+        meta = {"title": known["title"][:300], "authors": known.get("authors") or [],
+                "abstract": "", "published": known.get("published") or ""}
+    if meta is None:
+        first_line = next((l for l in text.splitlines()[1:] if len(l.strip()) > 10), source_url)
+        meta = {
+            "title": (pdf_meta.get("title") or first_line).strip()[:300],
+            "authors": [a.strip() for a in (pdf_meta.get("author") or "").split(",") if a.strip()],
+            "abstract": "", "published": "",
+        }
+    return {
+        "id": paper_id, "source_url": source_url, "title": meta["title"],
+        "authors": meta["authors"], "abstract": meta["abstract"],
+        "published": meta["published"], "num_pages": num_pages, "text": text,
+        "pdf_url": pdf_url, "pdf_sha256": hashlib.sha256(pdf_bytes).hexdigest(), "arxiv_version": version,
+    }, pdf_bytes
+
+
+ARCHIVE_FOLDER = "Archive"
+
+
+async def update_to_latest(paper_id: str) -> dict:
+    """Replaces the paper with arXiv's latest version, processed like a new paper. The version
+    it was becomes a paper of its own, "<id>v<version>", with its conversations, in the Archive
+    folder. The new version is downloaded first, so a failure leaves everything as it was."""
+    from . import figures  # figures imports this module
+
+    async with _locks[paper_id]:
+        paper = db.get_paper(paper_id)
+        if not paper or not paper.get("arxiv_version") or archived(paper_id):
+            raise PaperError("Only the current version of an arXiv paper can be updated")
+        new, pdf_bytes = await _fetch(paper_id, paper_id, paper_id)
+        if new["arxiv_version"] <= paper["arxiv_version"]:
+            raise PaperError(f"v{paper['arxiv_version']} is already the latest version")
+        archived_id = f"{paper_id}v{paper['arxiv_version']}"
+        if db.get_paper(archived_id):
+            raise PaperError(f"{archived_id} is already in the library")
+        # The files are caches of pinned downloads: one left behind is downloaded again.
+        for old, kept in ((pdf_path(paper_id), pdf_path(archived_id)),
+                          (figures.crops_dir(paper_id), figures.crops_dir(archived_id))):
+            if old.exists():
+                old.rename(kept)
+        db.archive_and_replace(paper_id, archived_id, db.top_folder(ARCHIVE_FOLDER), new)
+        pdf_path(paper_id).write_bytes(pdf_bytes)
+        db.set_latest_version(paper_id, new["arxiv_version"])
         return db.get_paper(paper_id)

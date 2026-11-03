@@ -1,4 +1,4 @@
-"""SQLite persistence for papers, conversations and messages."""
+"""SQLite persistence for papers, conversations and messages: a local file, or Turso (turso.py)."""
 
 import json
 import sqlite3
@@ -6,7 +6,7 @@ import time
 import uuid
 from contextlib import contextmanager
 
-from .config import DB_PATH
+from .config import DB_PATH, TURSO_AUTH_TOKEN, TURSO_DATABASE_URL
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS papers (
@@ -27,7 +27,14 @@ CREATE TABLE IF NOT EXISTS papers (
     refs_status TEXT,
     bib TEXT,                       -- JSON {"0": {number, authors, title, year, ..., arxiv_id, lookup}}
     bib_status TEXT,
-    folder_id TEXT                  -- folders.id, NULL when unfiled
+    folder_id TEXT,                 -- folders.id, NULL when unfiled
+    -- The PDF the text was extracted from: where it was downloaded (for arXiv, that exact version)
+    -- and its SHA-256, so a copy downloaded again can be checked against it.
+    pdf_url TEXT,
+    pdf_sha256 TEXT,
+    arxiv_version INTEGER,          -- NULL for a non-arXiv paper
+    latest_version INTEGER,         -- arXiv's latest version when last checked
+    latest_checked_at REAL
 );
 CREATE TABLE IF NOT EXISTS folders (
     id TEXT PRIMARY KEY,
@@ -75,8 +82,12 @@ CREATE INDEX IF NOT EXISTS idx_usage_time ON usage(created_at);
 
 @contextmanager
 def connect():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    if TURSO_DATABASE_URL:
+        from .turso import Connection  # libsql is only needed for Turso
+        conn = Connection(TURSO_DATABASE_URL, TURSO_AUTH_TOKEN)
+    else:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     try:
         yield conn
@@ -93,9 +104,14 @@ def init():
             _backfill_usage(conn)
         # Databases created before the glossary feature lack these columns.
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(papers)")}
-        for col in ("glossary", "glossary_status", "refs", "refs_status", "bib", "bib_status", "folder_id"):
+        for col in ("glossary", "glossary_status", "refs", "refs_status", "bib", "bib_status", "folder_id",
+                    "pdf_url", "pdf_sha256"):
             if col not in cols:
                 conn.execute(f"ALTER TABLE papers ADD COLUMN {col} TEXT")
+        # Databases created before papers were pinned to the PDF they came from.
+        for col, kind in (("arxiv_version", "INTEGER"), ("latest_version", "INTEGER"), ("latest_checked_at", "REAL")):
+            if col not in cols:
+                conn.execute(f"ALTER TABLE papers ADD COLUMN {col} {kind}")
         # Databases created before subfolders have flat folders.
         if "parent_id" not in {r["name"] for r in conn.execute("PRAGMA table_info(folders)")}:
             conn.execute("ALTER TABLE folders ADD COLUMN parent_id TEXT")
@@ -176,18 +192,51 @@ def list_papers():
     return [_paper_row(r) for r in rows]
 
 
-def insert_paper(paper: dict):
+def insert_paper(paper: dict, conn=None):
+    if conn is None:
+        with connect() as conn:
+            return insert_paper(paper, conn)
+    conn.execute(
+        """INSERT OR IGNORE INTO papers
+           (id, source_url, title, authors, abstract, published, num_pages, text, created_at,
+            pdf_url, pdf_sha256, arxiv_version, folder_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            paper["id"], paper["source_url"], paper["title"], json.dumps(paper["authors"]),
+            paper.get("abstract", ""), paper.get("published", ""), paper["num_pages"],
+            paper["text"], time.time(), paper["pdf_url"], paper["pdf_sha256"],
+            paper.get("arxiv_version"), paper.get("folder_id"),
+        ),
+    )
+
+
+def set_latest_version(paper_id: str, version: int):
     with connect() as conn:
-        conn.execute(
-            """INSERT OR IGNORE INTO papers
-               (id, source_url, title, authors, abstract, published, num_pages, text, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                paper["id"], paper["source_url"], paper["title"], json.dumps(paper["authors"]),
-                paper.get("abstract", ""), paper.get("published", ""), paper["num_pages"],
-                paper["text"], time.time(),
-            ),
-        )
+        conn.execute("UPDATE papers SET latest_version = ?, latest_checked_at = ? WHERE id = ?",
+                     (version, time.time(), paper_id))
+
+
+def archive_and_replace(paper_id: str, archived_id: str, archive_folder_id: str, new: dict):
+    """In one transaction: the paper becomes archived_id (with its conversations, analyses and
+    spending) in the archive folder, and the new paper takes its id and its folder."""
+    with connect() as conn:
+        folder_id = conn.execute("SELECT folder_id FROM papers WHERE id = ?", (paper_id,)).fetchone()["folder_id"]
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(papers)") if r["name"] not in ("id", "folder_id")]
+        conn.execute(f"INSERT INTO papers (id, folder_id, {', '.join(cols)})"
+                     f" SELECT ?, ?, {', '.join(cols)} FROM papers WHERE id = ?",
+                     (archived_id, archive_folder_id, paper_id))
+        conn.execute("UPDATE conversations SET paper_id = ? WHERE paper_id = ?", (archived_id, paper_id))
+        conn.execute("UPDATE usage SET paper_id = ? WHERE paper_id = ?", (archived_id, paper_id))
+        conn.execute("DELETE FROM papers WHERE id = ?", (paper_id,))
+        insert_paper({**new, "id": paper_id, "folder_id": folder_id}, conn)
+
+
+def top_folder(name: str) -> str:
+    """The id of the top-level folder with this name, created if there's none."""
+    with connect() as conn:
+        row = conn.execute("SELECT id FROM folders WHERE parent_id IS NULL AND name = ? COLLATE NOCASE",
+                           (name,)).fetchone()
+    return row["id"] if row else create_folder(name)["id"]
 
 
 ANALYSES = ("glossary", "refs", "bib")  # model-generated per-paper data; also the column names

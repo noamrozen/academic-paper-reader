@@ -40,6 +40,11 @@ Read arXiv papers next to an LLM research assistant. Paste a link, highlight a p
   question about a paper, Whisper is primed with the paper's title and glossary terms, so acronyms
   and method names tend to come out spelled as the paper spells them. The browser only allows the
   microphone over HTTPS or on localhost.
+- **arXiv versions:** a paper stays the arXiv version it was added as: its PDF's URL (with the
+  version) and SHA-256 are stored, and a copy downloaded again must match, so the PDF always fits
+  the stored text, notation and elements. When arXiv has a newer version, a notice above the paper
+  offers it: **Get v*N*** processes it like a new paper in the old one's place, and moves the old
+  version, with its conversations, to the **Archive** folder (as `<id>v<n>`).
 - Ask follow-ups in the chat panel. Every conversation is saved in the sidebar under its paper.
 - The home page is a **search session**: a chat with no paper in context, where you ask the assistant to
   find papers (a topic, a half-remembered title, related work). It searches arXiv and the web and links
@@ -82,6 +87,22 @@ Then open http://localhost:8000.
 
 Web search uses DuckDuckGo by default, with no key. Set `TAVILY_API_KEY` for better results.
 
+### Deploying to Vercel
+
+Vercel runs the app as a function whose files are read-only except `/tmp`, which is wiped now and
+then, so the database lives on [Turso](https://turso.tech) (hosted SQLite):
+
+1. In the Vercel project, **Storage → Create Database → Turso Cloud**, connected to the project
+   for all environments. It adds `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` to the project.
+2. Put the same two variables in `.env` (a local run then uses that database too).
+3. Copy the local library into it: `uv run python scripts/migrate_to_turso.py`.
+4. Add the provider keys (`OPENROUTER_API_KEY`, ...) to the project's environment variables, and
+   redeploy.
+
+On Vercel, `/tmp` only caches PDFs and figure crops, downloaded again (and checked against their
+SHA-256) when missing; arXiv PDFs go to the browser straight from arXiv, since a Vercel response is
+capped at 4.5 MB.
+
 ## Prefix caching design
 
 Every conversation about a paper sends the same prefix: the tool definitions, then a fixed system prompt, then a first user message that opens with the paper.
@@ -122,6 +143,7 @@ app/
   tools.py          web_search, fetch_url, search_arxiv, read_arxiv_paper (provider-neutral schemas)
   prompts.py        system prompt and the paper / question message formats
   db.py             SQLite: papers, folders, conversations, messages, usage
+  turso.py          Turso (hosted SQLite) behind the sqlite3 interface db.py uses, when TURSO_DATABASE_URL is set
   providers/        anthropic (Messages API, adaptive thinking), openai (Responses API, stateless),
                     gemini (google-genai), openrouter (Chat Completions),
                     all behind one stream_step() interface

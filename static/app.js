@@ -152,11 +152,61 @@ async function openPaper(source, known = {}) {
     state.paper = paper;
     showPaper(paper);
     loading.step("Rendering pages…", paper.title);
-    await renderPdf(paper.id);
+    await renderPdf(paper);
     loadAnalysis(paper);
+    checkNewerVersion(paper);
     return paper;
   } finally {
     loading.done();
+  }
+}
+
+// ---------------------------------------------------------------- arXiv versions
+
+// A paper is pinned to the arXiv version its text came from. An earlier version kept when a paper
+// was updated is a paper of its own, its id carrying the version ("2210.02747v2").
+const isArchived = (p) => /v\d+$/.test(p.id);
+const paperLabel = (p) => (p.arxiv_version && !isArchived(p) ? `${p.id}v${p.arxiv_version}` : p.id);
+
+// When arXiv has a newer version of the open paper, a notice offers it: getting it processes it
+// like a new paper, in this one's place, and moves this version (and its conversations) to the
+// Archive folder.
+async function checkNewerVersion(paper) {
+  showVersionNotice(null);
+  if (!paper.arxiv_version || isArchived(paper)) return;
+  let version = null;
+  try { ({ version } = await api(`/api/papers/${encodeURIComponent(paper.id)}/newer`)); } catch { return; }
+  if (version && state.paper?.id === paper.id) showVersionNotice(paper, version);
+}
+
+function showVersionNotice(paper, version) {
+  const box = $("version-notice");
+  box.hidden = !paper;
+  if (!paper) return box.replaceChildren();
+  const current = paper.arxiv_version;
+  box.replaceChildren(
+    el("span", {}, `A newer version of this paper is on arXiv: v${version} (you're reading v${current}). `,
+      el("span", { class: "muted" }, `Getting it adds v${version} in this paper's place and moves v${current}, `
+        + "with its conversations, to the Archive folder.")),
+    el("button", { type: "button", onclick: (e) => updatePaper(paper, version, e.currentTarget) }, `Get v${version}`));
+}
+
+async function updatePaper(paper, version, btn) {
+  btn.disabled = true;
+  const loading = startLoading(`Getting v${version}…`, paper.title);
+  try {
+    const updated = await api(`/api/papers/${encodeURIComponent(paper.id)}/update`, { method: "POST" });
+    state.paper = null;  // same id, new paper: open it afresh
+    await openPaper(updated.id);
+    resetChat();  // the open conversation went to the archive with the old version
+    history.replaceState(null, "", paperHash(updated.id));
+    setStatus(`v${paper.arxiv_version} is in the Archive folder, with its conversations.`);
+  } catch (e) {
+    btn.disabled = false;
+    setStatus(`Error: ${e.message}`);
+  } finally {
+    loading.done();
+    renderHistory();
   }
 }
 
@@ -786,7 +836,8 @@ function showPaper(paper) {
   title.replaceChildren();
   $("summarize-btn").hidden = !paper;
   if (paper) {
-    title.append(paper.title, el("a", { href: paper.source_url, target: "_blank" }, paper.id));
+    const href = paper.arxiv_version ? `https://arxiv.org/abs/${paperLabel(paper)}` : paper.source_url;
+    title.append(paper.title, el("a", { href, target: "_blank" }, paperLabel(paper)));
     document.title = `${paper.title} — Paper Reader`;
   } else {
     $("pages").replaceChildren();
@@ -794,6 +845,7 @@ function showPaper(paper) {
     document.title = "Paper Reader";
     setStatus("");
     showAnalysis(null);
+    showVersionNotice(null);
   }
 }
 
@@ -901,14 +953,17 @@ document.addEventListener("pointerdown", (e) => {
 let pageObserver = null;
 let renderToken = 0;
 
-async function renderPdf(paperId) {
+async function renderPdf(paper) {
   const token = ++renderToken;
   const pages = $("pages");
   pages.replaceChildren();
   clearBackSpots();  // the last paper's places
-  if (state.pdf) await state.pdf.destroy();
+  const old = state.pdf;
+  state.pdf = null;  // not used while it's being destroyed (a resize re-fits from it)
+  if (old) await old.destroy();
   state.pdf = await pdfjsLib.getDocument({
-    url: `/api/papers/${encodeURIComponent(paperId)}/pdf`, worker: pdfWorker,
+    // The file's hash in the URL: a paper updated to a newer version isn't shown from the cache.
+    url: `/api/papers/${encodeURIComponent(paper.id)}/pdf?sha=${paper.pdf_sha256 || ""}`, worker: pdfWorker,
   }).promise;
   if (token !== renderToken) return;
   layoutPages(token);
@@ -946,6 +1001,7 @@ async function layoutPages(token) {
 }
 
 async function renderPage(div, scale, token) {
+  if (!state.pdf) return;
   const page = await state.pdf.getPage(Number(div.dataset.page));
   if (token !== renderToken) return;
   const viewport = page.getViewport({ scale });
@@ -1020,6 +1076,7 @@ function scrollToSpot(spot, behavior = "auto") {
 
 // A zoom close to the fitted size snaps back to it (null: re-fits on resize, pages one at a time).
 async function setScale(scale, spot) {
+  if (!state.pdf) return;
   const fit = fitScale((await state.pdf.getPage(1)).getViewport({ scale: 1 }));
   state.scale = Math.abs(scale / fit - 1) < 0.05 ? null : scale;
   store.set("pdfScale", state.scale);
@@ -1869,7 +1926,7 @@ function paperGroup(p, { byPaper, folders, foldedPapers }) {
       // Navigating re-renders the sidebar via route(); staying on the paper doesn't.
       if (isOpen) { e.preventDefault(); renderHistory(); }
     },
-  }, p.title, el("span", { class: "pid" }, isFolded ? `${p.id} · ${chats}` : p.id)));
+  }, p.title, el("span", { class: "pid" }, isFolded ? `${paperLabel(p)} · ${chats}` : paperLabel(p))));
   row.append(el("button", {
     type: "button", class: "del", title: "Delete paper",
     onclick: async () => {

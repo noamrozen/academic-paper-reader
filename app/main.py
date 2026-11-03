@@ -3,13 +3,13 @@ import json
 import shutil
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import analysis, db, figures, papers, transcribe, usage
 from .agent import run_turn
-from .config import DEFAULT_MODELS, STATIC_DIR, VOICE_END_SILENCE
+from .config import DEFAULT_MODELS, ON_VERCEL, STATIC_DIR, VOICE_END_SILENCE
 from .providers import PROVIDERS, default_provider
 
 db.init()
@@ -216,12 +216,53 @@ def move_paper(paper_id: str, body: PaperPatch):
     return db.get_paper(paper_id)
 
 
-@app.get("/api/papers/{paper_id:path}/pdf")
-def paper_pdf(paper_id: str):
-    path = papers.pdf_path(paper_id)
-    if not path.exists():
+@app.get("/api/papers/{paper_id:path}/newer")
+async def paper_newer(paper_id: str):
+    """{"version": n} when arXiv has a newer version of the paper than the one in the library."""
+    paper = db.get_paper(paper_id)
+    if not paper:
         raise HTTPException(404)
-    return FileResponse(path, media_type="application/pdf")
+    try:
+        return {"version": await papers.newer_version(paper)}
+    except Exception:  # arXiv unreachable: ask again next time
+        return {"version": None}
+
+
+@app.post("/api/papers/{paper_id:path}/update")
+async def update_paper(paper_id: str):
+    """Replaces the paper with its latest arXiv version, processed like a new paper; the version
+    it was moves to the Archive folder with its conversations."""
+    if analysis.running(paper_id):
+        raise HTTPException(409, "Wait until this paper's analysis is done")
+    try:
+        paper = await papers.update_to_latest(paper_id)
+    except papers.PaperError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(502, f"Failed to get the new version: {e}")
+    analysis.ensure(paper["id"])
+    return paper
+
+
+@app.get("/api/papers/{paper_id:path}/pdf")
+async def paper_pdf(paper_id: str, sha: str | None = None):
+    paper = db.get_paper(paper_id)
+    if not paper:
+        raise HTTPException(404)
+    # Vercel caps a response at 4.5 MB, smaller than many papers: the browser gets arXiv PDFs from
+    # arXiv itself (which allows that).
+    if ON_VERCEL and not paper_id.startswith("url-"):
+        return RedirectResponse(papers.pdf_url(paper))
+    try:
+        path = await papers.ensure_pdf(paper)
+    except papers.PaperError as e:
+        raise HTTPException(409, str(e))
+    except Exception as e:
+        raise HTTPException(502, f"Could not download the PDF: {e}")
+    # Asked for by the file's hash (?sha=), the browser can keep its copy; otherwise it checks
+    # each time (a paper updated to a newer arXiv version keeps its id).
+    cache = "max-age=31536000, immutable" if sha and sha == paper.get("pdf_sha256") else "no-cache"
+    return FileResponse(path, media_type="application/pdf", headers={"Cache-Control": cache})
 
 
 @app.post("/api/papers/{paper_id:path}/bib/resolve")
@@ -233,8 +274,16 @@ async def resolve_bib(paper_id: str, body: BibResolveIn):
 @app.get("/api/papers/{paper_id:path}/crop")
 async def paper_crop(paper_id: str, kind: str, number: str):
     """PNG of a figure or table cropped from the PDF (located by its caption), cached on disk."""
-    if kind not in ("figure", "table") or not db.get_paper(paper_id):
+    paper = db.get_paper(paper_id)
+    if kind not in ("figure", "table") or not paper:
         raise HTTPException(404)
+    if not figures.crop_path(paper_id, kind, number).exists():
+        try:
+            await papers.ensure_pdf(paper)
+        except papers.PaperError as e:
+            raise HTTPException(409, str(e))
+        except Exception as e:
+            raise HTTPException(502, f"Could not download the PDF: {e}")
     refs = (db.get_analysis(paper_id, "refs") or {}).get("entries") or {}
     page = (refs.get(f"{kind} {number.upper()}") or {}).get("page")
     png = await asyncio.to_thread(figures.crop, paper_id, kind, number, page)

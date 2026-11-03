@@ -47,6 +47,10 @@ def ensure(paper_id: str, retry_failed: bool = False):
         _start(paper_id, name, resume=current["entries"] if resumable(name, current.get("entries")) else None)
 
 
+def running(paper_id: str) -> bool:
+    return any(pid == paper_id for pid, _ in _tasks)
+
+
 def resumable(name: str, entries: dict | None) -> bool:
     """Whether a run can continue from these entries; an outdated index starts over instead
     (keeping its old entries visible meanwhile)."""

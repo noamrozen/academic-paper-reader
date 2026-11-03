@@ -6,10 +6,17 @@ from dotenv import load_dotenv
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
 
-DATA_DIR = Path(os.environ.get("APR_DATA_DIR", ROOT / "data"))
+ON_VERCEL = bool(os.environ.get("VERCEL"))
+# Vercel can only write to /tmp, which is wiped now and then: there it holds only caches (PDFs and
+# figure crops, fetched again when missing), and the database must be on Turso (below).
+DATA_DIR = Path(os.environ.get("APR_DATA_DIR") or ("/tmp/apr" if ON_VERCEL else ROOT / "data"))
 PAPERS_DIR = DATA_DIR / "papers"
 DB_PATH = DATA_DIR / "app.db"
 STATIC_DIR = ROOT / "static"
+
+# A Turso (hosted libSQL) database to use instead of the SQLite file at DB_PATH.
+TURSO_DATABASE_URL = os.environ.get("TURSO_DATABASE_URL")
+TURSO_AUTH_TOKEN = os.environ.get("TURSO_AUTH_TOKEN")
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
