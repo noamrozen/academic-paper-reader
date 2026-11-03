@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Paper Reader</title>
+  <!-- Add to Home Screen (iPad/iPhone): full screen, with its own name and icon -->
+  <link rel="manifest" href="/static/manifest.webmanifest">
+  <link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/static/icon-180.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Papers">
+  <meta name="theme-color" content="#f6f6f4" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#1b1b1a" media="(prefers-color-scheme: dark)">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/web/pdf_viewer.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.css">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar">
+      <div class="sidebar-head">
+        <a href="#/" class="brand">Paper Reader</a>
+        <button id="new-folder" type="button" class="new-folder" title="New folder">+ Folder</button>
+        <button id="new-search" type="button" class="new-folder" title="Start a new search session" hidden>+ Search</button>
+      </div>
+      <div class="sidebar-tabs" role="tablist">
+        <button id="tab-papers" type="button" role="tab" class="sidebar-tab" aria-controls="history"
+          title="Papers you have opened, with their chats">Papers</button>
+        <button id="tab-searches" type="button" role="tab" class="sidebar-tab" aria-controls="searches"
+          title="Chats for finding papers, not tied to any paper">Searches</button>
+      </div>
+      <div id="folder-create" class="folder-create"></div>
+      <div id="history" class="history" role="tabpanel"></div>
+      <div id="searches" class="history" role="tabpanel" hidden></div>
+      <div class="sidebar-foot">
+        <div id="settings-wrap" class="settings-wrap">
+          <div id="settings-pop" class="settings-pop" hidden>
+            <div class="settings-pop-head">Model</div>
+            <label class="setting">Provider <select id="provider"></select></label>
+            <label class="setting">Model <input id="model" list="model-list" spellcheck="false"></label>
+            <datalist id="model-list"></datalist>
+            <p class="muted settings-note">Used for every chat, about a paper or a search, from the next message on.</p>
+          </div>
+          <button id="settings-btn" type="button" class="settings-btn" title="Model settings"
+            aria-expanded="false" aria-controls="settings-pop">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"
+              stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="3"/>
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+            </svg>
+            <span>Settings</span>
+          </button>
+        </div>
+        <div id="usage-wrap" class="usage-wrap">
+          <div id="usage-pop" class="settings-pop usage-pop" role="dialog" aria-labelledby="usage-pop-head" hidden>
+            <div class="usage-pop-top">
+              <div id="usage-pop-head" class="settings-pop-head">Usage</div>
+              <div class="usage-periods" role="tablist" aria-label="Period">
+                <button type="button" role="tab" data-period="day">Day</button>
+                <button type="button" role="tab" data-period="week">Week</button>
+                <button type="button" role="tab" data-period="month">Month</button>
+              </div>
+            </div>
+            <div id="usage-body" class="usage-body"><p class="muted settings-note">Loading…</p></div>
+          </div>
+          <button id="usage-btn" type="button" class="settings-btn" title="Spending on model calls"
+            aria-expanded="false" aria-controls="usage-pop">
+            <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2"
+              stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M3 3v18h18"/><path d="M7 16v-3M11 16V9M15 16v-5M19 16V6"/>
+            </svg>
+            <span>Usage</span>
+            <span id="usage-alert" class="usage-alert" hidden></span>
+          </button>
+        </div>
+      </div>
+    </aside>
+
+    <main id="main">
+      <header id="topbar">
+        <form id="paper-form" autocomplete="off">
+          <input id="paper-url" type="text" placeholder="Paste an arXiv link/ID or a PDF URL, or type a paper title, and press Enter">
+          <div id="search-results" class="search-results" hidden></div>
+        </form>
+        <div id="paper-status" class="muted"></div>
+        <div id="analysis-wrap" class="analysis-wrap" hidden>
+          <button id="analysis-pill" type="button" class="analysis-pill" aria-expanded="false" aria-controls="analysis-pop"
+            title="Show what is being analyzed">
+            <span class="analysis-dot" aria-hidden="true"></span><span id="analysis-label">Analyzing paper</span>
+            <span class="analysis-caret" aria-hidden="true">▾</span>
+          </button>
+          <div id="analysis-pop" class="analysis-pop" hidden>
+            <div class="analysis-pop-head">Building this paper's lookups</div>
+            <ul id="analysis-stages" class="analysis-stages"></ul>
+            <p class="analysis-pop-foot muted">They run in parallel, and links appear in the text as items come in, so you can keep reading. A lookup cut off at the model's output limit keeps what it produced; Continue asks the model to pick up from there.</p>
+          </div>
+        </div>
+        <button id="notation-btn" type="button" class="notation-btn" title="All notation in this paper" hidden>Notation</button>
+        <button id="elements-btn" type="button" class="notation-btn" title="All numbered elements in this paper: theorems, equations, figures, tables, sections…" hidden>Elements</button>
+        <button id="summarize-btn" type="button" class="notation-btn" title="Start a new chat that summarizes this paper" hidden>Summarize</button>
+        <div class="zoom">
+          <button id="zoom-out" title="Zoom out">−</button>
+          <button id="zoom-in" title="Zoom in">+</button>
+        </div>
+      </header>
+      <div id="paper-title" class="paper-title"></div>
+      <div class="viewer-wrap">
+        <div id="viewer">
+          <div class="empty-state" id="empty-state">
+            <h2>Read a paper with an assistant</h2>
+            <p>Paste an arXiv link above. Then highlight any passage in the paper and ask about it.</p>
+            <p class="muted">Each conversation starts with the full paper in the same format, so the provider's prefix cache is reused across conversations.</p>
+          </div>
+          <div id="pages"></div>
+        </div>
+        <button id="paper-back" type="button" class="paper-back" aria-label="Back to where you were" hidden>← Back</button>
+        <div id="analysis-bar" class="analysis-bar" hidden></div>
+        <div id="paper-loading" class="paper-loading" hidden>
+          <div class="loading-card" role="status">
+            <div class="loading-doc" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span></div>
+            <div class="loading-text">
+              <strong id="paper-loading-title"></strong>
+              <span id="paper-loading-detail" class="muted"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <div id="resizer" title="Drag to resize, click to hide the chat (⌘\)">
+      <button id="resizer-grip" type="button" class="resizer-grip" aria-label="Hide chat">›</button>
+    </div>
+
+    <section id="chat">
+      <button id="chat-expand" type="button" class="chat-expand" title="Show chat (⌘\)">
+        <span class="chat-expand-icon">«</span><span class="chat-expand-label">Chat</span>
+      </button>
+      <header class="chat-head">
+        <div class="chat-head-row">
+          <div id="chat-title" class="chat-title">New conversation</div>
+          <button id="new-chat" type="button" title="Start a new conversation on this paper">New chat</button>
+          <button id="chat-collapse" type="button" class="head-btn chat-collapse" title="Minimize chat (⌘\)">»</button>
+        </div>
+      </header>
+      <div id="messages" class="messages">
+        <div class="chat-empty muted" id="chat-empty">Highlight text in the paper to ask about it, or ask about the whole paper below.</div>
+      </div>
+      <form id="composer">
+        <div id="pending-selection" class="pending-selection" hidden></div>
+        <div class="composer-row">
+          <textarea id="question" rows="2" placeholder="Ask a question… (Enter to send, Shift+Enter for newline)"></textarea>
+          <button id="send" type="submit">Send</button>
+          <button id="stop" type="button" title="Stop generating (Esc)" hidden>Stop</button>
+        </div>
+      </form>
+    </section>
+  </div>
+
+  <div id="notation-modal" class="modal-backdrop" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="notation-title">
+      <header class="modal-head">
+        <h2 id="notation-title">Notation</h2>
+        <input id="notation-filter" type="search" placeholder="Filter terms and descriptions…" spellcheck="false">
+        <button id="notation-close" type="button" class="modal-close" title="Close (Esc)">×</button>
+      </header>
+      <dl id="notation-list" class="notation-list"></dl>
+      <div id="notation-empty" class="muted notation-empty" hidden>No matching terms.</div>
+    </div>
+  </div>
+
+  <div id="elements-modal" class="modal-backdrop" hidden>
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="elements-title">
+      <header class="modal-head">
+        <h2 id="elements-title">Numbered elements</h2>
+        <input id="elements-filter" class="modal-filter" type="search" placeholder="Filter by label or content…" spellcheck="false">
+        <button id="elements-close" type="button" class="modal-close" title="Close (Esc)">×</button>
+      </header>
+      <div id="elements-kinds" class="element-kinds"></div>
+      <div id="elements-list" class="elements-list"></div>
+      <div id="elements-empty" class="muted notation-empty" hidden>No matching elements.</div>
+    </div>
+  </div>
+
+  <dialog id="folder-delete" class="confirm-dialog">
+    <form method="dialog">
+      <p id="folder-delete-text"></p>
+      <p class="muted">Deleting the papers also deletes their chats. This can't be undone.</p>
+      <div class="confirm-actions">
+        <button value="cancel" class="secondary" autofocus>Cancel</button>
+        <button value="keep" id="folder-delete-keep" class="secondary">Delete folder, keep papers</button>
+        <button value="all" id="folder-delete-all"></button>
+      </div>
+    </form>
+  </dialog>
+
+  <div id="ask-popover" class="ask-popover" hidden>
+    <div class="ask-ref" id="ask-ref" hidden></div>
+    <div class="ask-cite" id="ask-cite" hidden></div>
+    <div class="ask-gloss" id="ask-gloss" hidden></div>
+    <div class="ask-quote" id="ask-quote"></div>
+    <textarea id="ask-input" rows="3" placeholder="Ask about this passage…"></textarea>
+    <div class="ask-actions">
+      <button id="ask-current" type="button" class="secondary" hidden>Ask in current chat <kbd>⌘⏎</kbd></button>
+      <button id="ask-new" type="button">New chat <kbd>⏎</kbd></button>
+    </div>
+  </div>
+
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>
