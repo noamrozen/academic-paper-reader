@@ -103,6 +103,7 @@ async function route() {
     try {
       const paper = await openPaper(decodeURIComponent(o[1]));
       resetChat();
+      if (phone.matches) setChatCollapsed(true); // a phone shows the paper, not the empty chat
       history.replaceState(null, "", paperHash(paper.id));
     } catch (e) {
       setStatus(`Error: ${e.message}`);
@@ -1010,8 +1011,10 @@ async function layoutPages(token) {
   const base = first.getViewport({ scale: 1 });
   const scale = state.scale || fitScale(base);
   state.layoutScale = scale;
-  // At "fit page" zoom on a touch screen, scrolling snaps from page to page (see styles.css).
-  $("viewer").classList.toggle("paged", !state.scale && touchScreen.matches);
+  // At "fit page" zoom on a touch screen, scrolling snaps from page to page (see styles.css),
+  // unless the page is taller than the viewer, as on a phone held sideways.
+  const fits = base.height * scale <= $("viewer").clientHeight;
+  $("viewer").classList.toggle("paged", !state.scale && touchScreen.matches && fits);
 
   if (pageObserver) pageObserver.disconnect();
   pageObserver = new IntersectionObserver((entries) => {
@@ -1068,11 +1071,15 @@ async function renderPage(div, scale, token) {
   linkifyPage(textDiv);
 }
 
-// With a mouse, the page fills the viewer's width. A touch screen shows one whole page at a time.
+// With a mouse, the page fills the viewer's width. A tablet shows one whole page at a time, and a
+// phone, too small for that, fills its width.
 const touchScreen = matchMedia("(hover: none)");
+// One panel at a time (styles.css): keep in step with its phone media query.
+const phone = matchMedia("(max-width: 640px), (hover: none) and (max-height: 500px)");
 function fitScale(base) {
   const viewer = $("viewer");
   if (!touchScreen.matches) return Math.min(2, (viewer.clientWidth - 100) / base.width);
+  if (phone.matches) return (viewer.clientWidth - 16) / base.width;
   // Room for the page number beside the page, and the gap above it.
   return Math.min((viewer.clientWidth - 72) / base.width, (viewer.clientHeight - 24) / base.height);
 }
@@ -1952,7 +1959,9 @@ function paperGroup(p, { byPaper, folders, foldedPapers }) {
     href: paperHash(p.id), title: p.title,
     // Clicking the open paper folds/unfolds its chats; clicking another paper opens it unfolded.
     onclick: (e) => {
-      if (!convList.length || e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
+      if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return;
+      if (phone.matches) setChatCollapsed(true); // a phone shows the paper, not the chat over it
+      if (!convList.length) return;
       const isOpen = state.paper?.id === p.id;
       if (isOpen && !isFolded) foldedPapers.add(p.id); else foldedPapers.delete(p.id);
       store.set("foldedPapers", [...foldedPapers]);
@@ -2749,6 +2758,21 @@ document.addEventListener("keydown", (e) => {
     setChatCollapsed(!$("app").classList.contains("chat-collapsed"));
   }
 });
+
+// On a phone the sidebar is a drawer (styles.css): ☰ opens it, and tapping outside it or picking
+// something in it closes it. Folding a paper's chats (preventDefault) keeps it open.
+const setSidebarOpen = (open) => $("app").classList.toggle("sidebar-open", open);
+$("menu-btn").onclick = () => setSidebarOpen(true);
+$("sidebar-backdrop").onclick = () => setSidebarOpen(false);
+$("sidebar").addEventListener("click", (e) => {
+  if (!e.defaultPrevented && e.target.closest("a[href], #new-search")) setSidebarOpen(false);
+});
+const urlPlaceholder = $("paper-url").placeholder;
+const fitPlaceholder = () => {
+  $("paper-url").placeholder = phone.matches ? "arXiv link, PDF URL or paper title" : urlPlaceholder;
+};
+phone.addEventListener("change", fitPlaceholder);
+fitPlaceholder();
 
 // ---------------------------------------------------------------- Boot
 

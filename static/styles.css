@@ -758,3 +758,43 @@ a.cite-title:hover { text-decoration: underline; }
   #app.search-mode #main { grid-column: 1; grid-row: 2; }
   #app.search-mode #chat { grid-column: 1; grid-row: 3; }
 }
+
+/* Phones: one panel at a time. The sidebar is a drawer that ☰ slides in over the page, and the
+   chat is a sheet over the paper, minimized to a bar at the bottom. Keep the query in step with
+   `phone` in app.js. */
+.menu-btn, .sidebar-backdrop { display: none; }
+@media (max-width: 640px), (hover: none) and (max-height: 500px) {
+  #app { display: flex; flex-direction: column; height: 100dvh; }
+  #main { flex: 1; }
+  #app.search-mode #main { flex: none; }
+  #app.search-mode #chat { flex: 1; }
+  #app:not(.search-mode, .chat-collapsed) #chat { position: fixed; inset: 0; z-index: 35; }
+  .chat-head .chat-collapse { transform: rotate(90deg); }
+  #app.chat-collapsed .chat-expand { padding: 12px; }
+
+  #sidebar {
+    position: fixed; z-index: 45; inset: 0 auto 0 0; width: min(320px, 85vw); max-height: none;
+    box-shadow: 0 0 40px rgba(0, 0, 0, 0.3);
+    transform: translateX(-100%); visibility: hidden; transition: transform 0.2s ease-out, visibility 0.2s;
+  }
+  #app.sidebar-open #sidebar { transform: none; visibility: visible; }
+  #app.sidebar-open .sidebar-backdrop { display: block; position: fixed; inset: 0; z-index: 44; background: rgba(0, 0, 0, 0.35); }
+  .usage-pop { max-width: calc(100vw - 16px); }
+
+  /* The address box gets the first row of a phone held upright; the paper's buttons wrap below it.
+     Pinch zooms. */
+  #topbar { flex-wrap: wrap; gap: 8px; padding: 8px 10px; }
+  .menu-btn {
+    display: grid; place-items: center; flex: none; width: 38px; height: 38px; padding: 0;
+    border: 1px solid var(--border); border-radius: 8px; background: var(--panel); color: var(--muted); cursor: pointer;
+  }
+  #paper-form { flex: 1 1 260px; min-width: 0; }
+  #paper-status { flex-basis: 100%; white-space: normal; }
+  #paper-status:empty, .zoom, .page-num { display: none; }
+  .paper-title { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; padding: 6px 12px; }
+
+  .modal-backdrop { padding: 8px; }
+  .modal { max-height: 100%; }
+  /* iOS zooms into any field whose text is smaller than 16px. */
+  input, select, textarea, .setting :is(select, input), #notation-filter, .modal-filter { font-size: max(16px, 1em); }
+}
