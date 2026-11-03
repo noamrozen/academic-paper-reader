@@ -1,5 +1,5 @@
-// Turns the microphone into what the live transcriber reads (app/transcribe.py): 16 kHz, 16-bit
-// mono PCM, posted to the page in 100 ms chunks. Downsampled by averaging each run of input
+// Turns the microphone into what voice questions are made of (the Listener in app.js, and Whisper
+// via app/transcribe.py): 16 kHz, 16-bit mono PCM, posted to the page in 100 ms chunks. Downsampled by averaging each run of input
 // samples (the browser records at 44.1 or 48 kHz), which is enough low-pass for speech.
 const RATE = 16000;
 const CHUNK = RATE / 10;

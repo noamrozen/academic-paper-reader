@@ -1324,6 +1324,7 @@ async function loadConfig() {
   // Always start from the configured default (.env), not a choice remembered from an earlier visit.
   const chosen = cfg.providers.find((p) => p.id === cfg.default_provider);
   if (chosen) setProvider(chosen.id, chosen.default_model);
+  if (cfg.voice) addVoice(cfg.voice);
 }
 
 async function setProvider(providerId, model) {
@@ -2221,14 +2222,96 @@ const CUT_OFF = {
 
 // A mic button that records a question, transcribed while it's spoken: the text grows in `input`
 // as you talk, and the recording stops by itself when you go quiet (or on a second click). The
-// text isn't sent, so it can be checked first. The microphone streams to the server as 16 kHz
-// PCM over a WebSocket; a local Whisper model transcribes it, primed with the open paper's terms,
-// and a voice-activity detector hears the end of the question (app/transcribe.py).
+// text isn't sent, so it can be checked first. The browser listens: a Listener tells speech from
+// pauses in the microphone's 16 kHz PCM, each phrase goes to the server once you pause after it,
+// for its final text, and the phrase still being spoken now and then for a quick draft. The server
+// has Whisper on OpenRouter transcribe them, primed with the open paper's terms (app/transcribe.py).
 const MIC_SVG = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
   stroke-linejoin="round" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/>
   <path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>`;
 const MAX_RECORDING_MS = 2 * 60 * 1000;
+const DRAFT_TIMEOUT_MS = 4000;
 let recording = null;  // {stop} of the one recording in progress
+let voiceEndSilence = 1.5;  // s of silence that ends a question (VOICE_END_SILENCE, from /api/config)
+
+// Splits the microphone's 100 ms frames (static/mic-worklet.js) into phrases. A frame is speech when
+// it's well above the background noise, taken as the quietest frame of the last few seconds.
+// push() returns what's due: {phrase} (the PCM of a phrase followed by a pause: its text is final),
+// {draft} (the phrase still being spoken, every DRAFT_EVERY s), {end} (after a long silence, or none
+// spoken). finish() is the PCM of a phrase cut off by stopping the recording, if any.
+class Listener {
+  static FRAME = 0.1;  // s per frame
+  static PAUSE = 0.6;  // s of silence that closes a phrase
+  static NO_SPEECH = 8;  // s with no speech at all before giving up
+  static MIN_DRAFT = 0.4;  // s of speech before a phrase gets a draft (Whisper guesses wildly from less)
+  static DRAFT_EVERY = 1;  // s between drafts
+  static PAD = 2;  // frames kept around speech, so word edges aren't clipped
+  static NOISE_WINDOW = 50;  // frames over which the background noise is the quietest
+
+  constructor(endSilence) {
+    this.endSilence = endSilence;
+    this.frames = [];
+    this.levels = [];  // dBFS per frame
+    this.run = 0;  // consecutive speech frames
+    this.heard = false;
+    this.start = null;  // first speech frame of the open phrase (null: none yet)
+    this.last = -1;  // last speech frame
+    this.drafted = 0;  // frame of the last draft
+  }
+
+  static level(frame) {
+    let sum = 0;
+    for (const v of frame) sum += v * v;
+    return 10 * Math.log10(sum / frame.length / 32768 ** 2 + 1e-10);
+  }
+
+  push(frame) {
+    const i = this.frames.push(frame) - 1, F = Listener.FRAME;
+    const db = Listener.level(frame);
+    this.levels.push(db);
+    const noise = Math.min(...this.levels.slice(-Listener.NOISE_WINDOW));
+    // 15 dB over the noise, but always heard at -35 dBFS (normal speech) and never below -55.
+    const speech = db > Math.min(-35, Math.max(-55, noise + 15));
+    this.run = speech ? this.run + 1 : 0;
+    if (speech && (this.run >= 2 || this.start !== null)) {  // a lone loud frame is a click
+      this.start ??= i - this.run + 1;
+      this.last = i;
+      this.heard = true;
+    }
+    if (!this.heard) return (i + 1) * F >= Listener.NO_SPEECH ? { end: true } : {};
+    const out = {}, silence = (i - this.last) * F;
+    if (this.start !== null && silence >= Listener.PAUSE) {
+      out.phrase = this.#audio(this.last + Listener.PAD + 1);
+      this.start = null;
+    } else if (this.start !== null && (this.last - this.start + 1) * F >= Listener.MIN_DRAFT
+               && (i - this.drafted) * F >= Listener.DRAFT_EVERY) {
+      out.draft = this.#audio(i + 1);
+      this.drafted = i;
+    }
+    if (silence >= this.endSilence) out.end = true;
+    return out;
+  }
+
+  finish() {
+    return this.start === null ? null : this.#audio(this.frames.length);
+  }
+
+  #audio(end) {  // the open phrase's frames, up to `end`, as one Int16Array
+    const frames = this.frames.slice(Math.max(0, this.start - Listener.PAD), end);
+    const pcm = new Int16Array(frames.reduce((n, f) => n + f.length, 0));
+    let at = 0;
+    for (const f of frames) { pcm.set(f, at); at += f.length; }
+    return pcm;
+  }
+}
+
+async function transcribePhrase(pcm, params, signal) {
+  const res = await fetch(`/api/transcribe?${new URLSearchParams(params)}`, {
+    method: "POST", headers: { "Content-Type": "application/octet-stream" }, body: pcm, signal,
+  });
+  if (!res.ok) throw new Error(await errorMessage(res));
+  return (await res.json()).text;
+}
 
 function micButton(input) {
   const time = el("span", { class: "mic-time" });
@@ -2256,13 +2339,6 @@ function micButton(input) {
     pcm.connect(ctx.destination);  // it outputs silence, but a node must reach the output to run in every browser
     ctx.resume();
 
-    const paper = state.paper && !state.searchMode ? `?paper_id=${encodeURIComponent(state.paper.id)}` : "";
-    const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/transcribe/live${paper}`);
-    const queue = [];  // sent once the socket opens
-    const send = (data) => (ws.readyState === WebSocket.OPEN ? ws.send(data) : queue.push(data));
-    ws.onopen = () => { queue.forEach((d) => ws.send(d)); queue.length = 0; };
-    pcm.port.onmessage = (e) => send(e.data);
-
     // The transcript replaces the selection (or goes at the end), spaced from the text around it.
     const original = input.value;
     const focused = document.activeElement === input;
@@ -2276,6 +2352,45 @@ function micButton(input) {
       input.scrollTop = input.scrollHeight;
     };
     input.readOnly = true;  // the transcript is being written into it
+
+    // Each phrase's text: its latest draft until its final text arrives. Finals are requested one
+    // after another, so each is primed with the question's text before it.
+    const paper = state.paper && !state.searchMode ? { paper_id: state.paper.id } : {};
+    const aborter = new AbortController();
+    const phrases = [];  // {text, final}
+    let draft = "", drafting = false, phraseNo = 0;
+    let finals = Promise.resolve();
+    const render = () => show([...phrases.map((p) => p.text), draft].filter(Boolean).join(" "));
+    const closePhrase = (audio) => {
+      const phrase = { text: draft, final: false };
+      phrases.push(phrase);
+      draft = "";
+      phraseNo++;
+      finals = finals.then(async () => {
+        const context = phrases.filter((p) => p.final).map((p) => p.text).join(" ");
+        phrase.text = await transcribePhrase(audio, { ...paper, context }, aborter.signal);
+        phrase.final = true;
+        if (!finished) render();
+      });
+    };
+    const requestDraft = (audio) => {
+      if (drafting) return;  // one at a time: a slow one is skipped, not queued
+      drafting = true;
+      const no = phraseNo;
+      // Given up on after a few seconds: it would be stale, and it holds up the next one.
+      transcribePhrase(audio, { ...paper, draft: 1 }, AbortSignal.any([aborter.signal, AbortSignal.timeout(DRAFT_TIMEOUT_MS)]))
+        .then((text) => { if (no === phraseNo && !finished) { draft = text; render(); } })
+        .catch(() => {})  // only a draft: the phrase's final text follows
+        .finally(() => { drafting = false; });
+    };
+
+    const listener = new Listener(voiceEndSilence);
+    pcm.port.onmessage = (e) => {
+      const due = listener.push(new Int16Array(e.data));
+      if (due.phrase) closePhrase(due.phrase);
+      if (due.draft) requestDraft(due.draft);
+      if (due.end) end();
+    };
 
     const started = Date.now();
     const tick = setInterval(() => {
@@ -2304,8 +2419,7 @@ function micButton(input) {
       if (finished) return;
       finished = true;
       stopCapture();
-      ws.onclose = ws.onmessage = null;
-      if (ws.readyState <= WebSocket.OPEN) ws.close();
+      aborter.abort();
       rec = null;
       if (recording === handle) recording = null;
       btn.classList.remove("recording", "busy");
@@ -2317,22 +2431,25 @@ function micButton(input) {
         input.setSelectionRange(head.length, head.length);
       }
     };
-
-    ws.onmessage = (e) => {
-      const m = JSON.parse(e.data);
-      if (m.type === "text") show(m.text);
-      else if (m.type === "end") stopCapture();  // the server heard the question end
-      else if (m.type === "final") {
-        show(m.text);
-        finish(m.text ? null : "No speech heard");
-      } else if (m.type === "error") {
-        finish(m.message);
-      }
+    // The question is over (a long silence, or stopped): wait for the last phrases' final text.
+    const end = () => {
+      if (!capturing) return;
+      stopCapture();
+      const rest = listener.finish();
+      if (rest) closePhrase(rest);
+      finals.then(
+        () => {
+          if (finished) return;
+          const text = phrases.map((p) => p.text).filter(Boolean).join(" ");
+          show(text);
+          finish(text ? null : "No speech heard");
+        },
+        (e) => finish(e.name === "AbortError" ? null : e.message),
+      );
     };
-    ws.onclose = () => finish("Transcription stopped: lost the connection to the server");
 
     const handle = recording = rec = {
-      stop: () => { stopCapture(); send(JSON.stringify({ type: "stop" })); },
+      stop: end,
       cancel: () => { input.value = original; input.dispatchEvent(new Event("input", { bubbles: true })); finish(); },
     };
   };
@@ -2340,7 +2457,9 @@ function micButton(input) {
   return btn;
 }
 
-if (navigator.mediaDevices?.getUserMedia && window.AudioWorkletNode) {  // needs https (or localhost)
+function addVoice(voice) {
+  if (!navigator.mediaDevices?.getUserMedia || !window.AudioWorkletNode) return;  // needs https (or localhost)
+  voiceEndSilence = voice.end_silence;
   $("send").before(micButton($("question")));
   $("ask-new").parentNode.prepend(popoverMic = micButton($("ask-input")));
 }

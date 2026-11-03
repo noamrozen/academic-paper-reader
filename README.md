@@ -31,14 +31,15 @@ Read arXiv papers next to an LLM research assistant. Paste a link, highlight a p
 - **Ask by voice:** the 🎙 button next to Send (and in the highlight popover) records a question.
   It's transcribed while you speak, so the text grows in the box as you talk, and recording stops
   by itself once you've been quiet for 1.5 s (`VOICE_END_SILENCE`), or when you click 🎙 again.
-  The text isn't sent, so you can check it first. The microphone streams to the server, where a
-  local open-source [Whisper](https://github.com/openai/whisper) model
-  ([faster-whisper](https://github.com/SYSTRAN/faster-whisper), downloaded on first use)
-  transcribes it: `base.en` drafts the phrase being spoken (`WHISPER_DRAFT_MODEL`), and `small.en`
-  (`WHISPER_MODEL`) redoes each phrase at full quality once you pause after it. Silero VAD, bundled
-  with faster-whisper, tells speech from pauses. For a question about a paper, Whisper is primed
-  with the paper's title and glossary terms, so acronyms and method names come out spelled as the
-  paper spells them. The browser only allows the microphone over HTTPS or on localhost.
+  The text isn't sent, so you can check it first. The browser tells speech from pauses and sends
+  each phrase to the server once you pause after it, where [Whisper](https://github.com/openai/whisper)
+  large-v3 on [OpenRouter](https://openrouter.ai/docs/guides/overview/multimodal/stt.md)
+  (`TRANSCRIBE_MODEL`) gives it its final text; the phrase still being spoken gets quick drafts from
+  `whisper-large-v3-turbo` (`TRANSCRIBE_DRAFT_MODEL`). It needs `OPENROUTER_API_KEY` (the button is
+  hidden without one) and costs about $0.0005 per minute of speech, shown under Usage. For a
+  question about a paper, Whisper is primed with the paper's title and glossary terms, so acronyms
+  and method names tend to come out spelled as the paper spells them. The browser only allows the
+  microphone over HTTPS or on localhost.
 - Ask follow-ups in the chat panel. Every conversation is saved in the sidebar under its paper.
 - The home page is a **search session**: a chat with no paper in context, where you ask the assistant to
   find papers (a topic, a half-remembered title, related work). It searches arXiv and the web and links
@@ -115,8 +116,8 @@ app/
   analysis.py       per-paper glossary, numbered-element index and bibliography (default model, after ingest);
                     arXiv lookup for cited papers
   figures.py        crops a figure/table out of the PDF by its caption (PyMuPDF, no model)
-  transcribe.py     voice questions: live transcription (local Whisper, primed with the paper's
-                    terms) and end-of-question detection (Silero VAD); /api/transcribe/live streams it
+  transcribe.py     voice questions: one phrase at a time to Whisper on OpenRouter, primed with the
+                    paper's terms (POST /api/transcribe); the browser finds the phrases (Listener, app.js)
   usage.py          spending: records each model call's tokens and cost, sums them per day/week/month
   tools.py          web_search, fetch_url, search_arxiv, read_arxiv_paper (provider-neutral schemas)
   prompts.py        system prompt and the paper / question message formats

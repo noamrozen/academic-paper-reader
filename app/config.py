@@ -32,14 +32,14 @@ OPENROUTER_MAX_TOKENS = int(os.environ.get("OPENROUTER_MAX_TOKENS", "16384"))
 
 CLAUDE_PAPER_CACHE_TTL = os.environ.get("CLAUDE_PAPER_CACHE_TTL", "1h")
 
-# Voice questions: a Whisper model run locally by faster-whisper (downloaded on first use).
-# "small.en" transcribes a short question in about two seconds on an Apple M-series CPU;
-# "large-v3-turbo" is more robust to accents and noise but around three times slower.
-WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "small.en")
-# Drafts shown while a phrase is still being spoken: a smaller, faster model (~0.4 s per draft).
-WHISPER_DRAFT_MODEL = os.environ.get("WHISPER_DRAFT_MODEL", "base.en")
-# Spoken language; empty detects it (needs a multilingual model, i.e. one without ".en").
-WHISPER_LANGUAGE = os.environ.get("WHISPER_LANGUAGE", "en") or None
+# Voice questions: speech-to-text models on OpenRouter (needs OPENROUTER_API_KEY). Each phrase gets
+# its final text from TRANSCRIBE_MODEL once you pause after it (Whisper large-v3: ~0.7 s for a short
+# phrase, about $0.0005 per minute of speech, and it follows the prompt with the paper's terms).
+TRANSCRIBE_MODEL = os.environ.get("TRANSCRIBE_MODEL", "openai/whisper-large-v3")
+# Drafts shown while a phrase is still being spoken: a faster, cheaper model.
+TRANSCRIBE_DRAFT_MODEL = os.environ.get("TRANSCRIBE_DRAFT_MODEL", "openai/whisper-large-v3-turbo")
+# Spoken language (ISO-639-1); empty detects it.
+TRANSCRIBE_LANGUAGE = os.environ.get("TRANSCRIBE_LANGUAGE", "en") or None
 # Seconds of silence after speaking that end a voice question (recording stops by itself).
 VOICE_END_SILENCE = float(os.environ.get("VOICE_END_SILENCE", "1.5"))
 

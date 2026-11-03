@@ -1,22 +1,22 @@
 import asyncio
-import contextlib
 import json
 import shutil
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import analysis, db, figures, papers, transcribe, usage
 from .agent import run_turn
-from .config import DEFAULT_MODELS, STATIC_DIR
+from .config import DEFAULT_MODELS, STATIC_DIR, VOICE_END_SILENCE
 from .providers import PROVIDERS, default_provider
 
 db.init()
 app = FastAPI(title="Academic Paper Reader")
 _model_cache: dict[str, list[str]] = {}
 _arxiv_titles: dict[str, str | None] = {}  # arXiv ID -> title (None: no such paper)
+MAX_PHRASE_BYTES = 2 * 60 * 16000 * 2  # two minutes of 16 kHz 16-bit audio
 
 
 @app.middleware("http")
@@ -80,7 +80,7 @@ def config():
     return {"default_provider": (p := default_provider()) and p.id, "providers": [
         {"id": p.id, "label": p.label, "available": p.available(), "default_model": DEFAULT_MODELS[p.id]}
         for p in PROVIDERS.values()
-    ]}
+    ], "voice": {"end_silence": VOICE_END_SILENCE} if transcribe.available() else None}
 
 
 @app.get("/api/providers/{provider_id}/models")
@@ -308,61 +308,20 @@ async def usage_summary(tz: str | None = None):
     return await usage.summary(tz)
 
 
-@app.websocket("/api/transcribe/live")
-async def transcribe_live(ws: WebSocket, paper_id: str | None = None):
-    """A voice question, transcribed while it's spoken. The browser sends 16 kHz 16-bit mono PCM as
-    binary messages, and {"type": "stop"} if the user stops it. The server sends
-    {"type": "text", "text"} as the transcript grows, {"type": "end"} when it hears the question
-    end (the browser stops recording), then {"type": "final", "text"}. With paper_id, the paper's
-    terms guide spelling."""
-    await ws.accept()
-    live = transcribe.LiveTranscript(await asyncio.to_thread(transcribe.paper_prompt, paper_id))
-    wake = asyncio.Event()
-    stopped = False  # by the user, or the browser went away
-    gone = False
-
-    async def receive():
-        nonlocal stopped, gone
-        try:
-            while True:
-                msg = await ws.receive()
-                if msg["type"] == "websocket.disconnect":
-                    gone = True
-                    break
-                if msg.get("bytes"):
-                    live.add(msg["bytes"])
-                    wake.set()
-                elif msg.get("text"):  # {"type": "stop"}
-                    break
-        finally:
-            stopped = True
-            wake.set()
-
-    receiver = asyncio.create_task(receive())
+@app.post("/api/transcribe")
+async def transcribe_phrase(request: Request, paper_id: str | None = None, context: str = "", draft: bool = False):
+    """One phrase of a voice question, as 16 kHz 16-bit mono PCM: its text. context is the question's
+    text so far; draft asks for a quick draft of a phrase still being spoken. With paper_id, the
+    paper's terms guide spelling."""
+    if not transcribe.available():
+        raise HTTPException(400, "Voice questions need OPENROUTER_API_KEY")
+    pcm = await request.body()
+    if len(pcm) > MAX_PHRASE_BYTES:
+        raise HTTPException(413, "Recording too long")
     try:
-        while not stopped:
-            await wake.wait()
-            wake.clear()
-            if stopped:
-                break
-            event = await asyncio.to_thread(live.step)
-            if event == "text":
-                await ws.send_json({"type": "text", "text": live.text})
-            elif event == "end":
-                await ws.send_json({"type": "end"})
-                break
-        if not gone:
-            text = await asyncio.to_thread(live.finish)
-            await ws.send_json({"type": "final", "text": text})
-            await ws.close()
-    except (WebSocketDisconnect, RuntimeError):  # the browser closed it (e.g. cancelled)
-        pass
-    except Exception as e:  # model download failure, ...
-        with contextlib.suppress(Exception):
-            await ws.send_json({"type": "error", "message": f"Transcription failed: {e}"})
-            await ws.close()
-    finally:
-        receiver.cancel()
+        return {"text": await transcribe.transcribe(pcm, paper_id=paper_id, context=context, draft=draft)}
+    except Exception as e:
+        raise HTTPException(502, f"Transcription failed: {e or type(e).__name__}")
 
 
 def _sse(event: dict) -> str:

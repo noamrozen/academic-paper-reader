@@ -8,11 +8,9 @@ authors = [
 requires-python = ">=3.12"
 dependencies = [
     "anthropic>=1.11.0",
-    # faster-whisper 1.2 decodes audio with an av.open() argument that av 18 removed
     "beautifulsoup4>=4.15.0",
     "ddgs>=9.16.0",
     "fastapi>=0.142.2",
-    "faster-whisper>=1.2.1",
     "google-genai>=2.28.0",
     "httpx>=0.28.1",
     "openai>=3.24.0",
