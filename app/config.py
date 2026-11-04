@@ -94,6 +94,11 @@ HTTP_HEADERS = {"User-Agent": "academic-paper-reader/0.1 (+https://github.com/)"
 
 PAPERS_DIR.mkdir(parents=True, exist_ok=True)
 
+# Without it a deployment would quietly use a SQLite file in /tmp, which each instance has its own
+# of: data, and sign-ins, would vanish between requests.
+if ON_VERCEL and USE_TURSO and not TURSO_DATABASE_URL:
+    raise RuntimeError("Set TURSO_DATABASE_URL (and TURSO_AUTH_TOKEN) for this environment, or unset USE_TURSO")
+
 if not SECRET_KEY:
     if ON_VERCEL:
         raise RuntimeError("Set SECRET_KEY in the Vercel project's environment variables"
