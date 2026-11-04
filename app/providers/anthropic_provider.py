@@ -2,7 +2,7 @@ import re
 
 import anthropic
 
-from ..config import ANTHROPIC_API_KEY, CLAUDE_PAPER_CACHE_TTL
+from ..config import CLAUDE_PAPER_CACHE_TTL
 from .base import Provider, StepResult, TextDelta, ThinkingDelta, raw_for
 
 # Models that reject adaptive thinking (pre-4.6 generations).
@@ -15,11 +15,8 @@ class AnthropicProvider(Provider):
     id = "anthropic"
     label = "Claude"
 
-    def __init__(self):
-        self._client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
-
-    def available(self):
-        return self._client is not None
+    def __init__(self, api_key: str):
+        self._client = anthropic.AsyncAnthropic(api_key=api_key)
 
     async def list_models(self):
         return [m.id async for m in self._client.models.list(limit=100)]

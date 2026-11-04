@@ -4,6 +4,9 @@ The libsql package follows sqlite3 except that its rows are plain tuples, its cu
 iterated, it takes only positional parameters, and it cuts strings at a NUL character. Rows here
 are like sqlite3.Row (by index or column name, and dict(row)), named parameters (:name) are turned
 into positional ones, and NULs are dropped from the strings written.
+
+Its executescript stops at the first failing statement without raising (leaving a transaction
+open), so a migration that must not fail silently runs its statements one by one with execute.
 """
 
 import re
@@ -78,6 +81,9 @@ class Connection:
 
     def commit(self):
         self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
 
     def close(self):
         self._conn.close()

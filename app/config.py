@@ -14,15 +14,45 @@ PAPERS_DIR = DATA_DIR / "papers"
 DB_PATH = DATA_DIR / "app.db"
 STATIC_DIR = ROOT / "static"
 
-# A Turso (hosted libSQL) database to use instead of the SQLite file at DB_PATH.
-TURSO_DATABASE_URL = os.environ.get("TURSO_DATABASE_URL")
-TURSO_AUTH_TOKEN = os.environ.get("TURSO_AUTH_TOKEN")
+# A Turso (hosted libSQL) database to use instead of the SQLite file at DB_PATH. Only a production
+# deployment on Vercel uses it by itself: a local run, `vercel dev` or a preview deployment that has
+# the production database's settings (in .env, or from a Vercel integration connected to every
+# environment) would read it, and migrate it to a schema the deployed app doesn't know. Anywhere
+# else, USE_TURSO=1 opts in (e.g. for a preview's own database).
+USE_TURSO = os.environ.get("VERCEL_ENV") == "production" or os.environ.get("USE_TURSO") == "1"
+TURSO_DATABASE_URL = os.environ.get("TURSO_DATABASE_URL") if USE_TURSO else None
+TURSO_AUTH_TOKEN = os.environ.get("TURSO_AUTH_TOKEN") if USE_TURSO else None
 
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY")
+# The keys above are the server's: only admins' requests use them. Other users add their own
+# (stored encrypted, see crypto.py), under the same names.
+SERVER_KEYS = {name: key for name, key in (
+    ("anthropic", ANTHROPIC_API_KEY), ("openai", OPENAI_API_KEY), ("gemini", GEMINI_API_KEY),
+    ("openrouter", OPENROUTER_API_KEY), ("tavily", TAVILY_API_KEY),
+) if key}
+
+# Accounts. An admin is a user whose verified email is listed here (comma-separated).
+ADMIN_EMAILS = {e.strip().lower() for e in os.environ.get("ADMIN_EMAILS", "").split(",") if e.strip()}
+# Signs nothing by itself, but encrypts the API keys users save: changing it loses them. Required on
+# Vercel; a local run makes one in the data directory.
+SECRET_KEY = os.environ.get("SECRET_KEY")
+# "Sign in with Google": an OAuth client of type "Web application" (see "Accounts" in the README).
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET")
+# The app's address, for links in emails and Google's redirect; by default, the address a request came to.
+PUBLIC_URL = os.environ.get("PUBLIC_URL", "").rstrip("/")
+# Emails (verifying an address, resetting a password) go through Resend if RESEND_API_KEY is set, else
+# through SMTP if SMTP_HOST is; with neither, their links are only written to the log.
+EMAIL_FROM = os.environ.get("EMAIL_FROM", "Paper Reader <onboarding@resend.dev>")
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
+SMTP_HOST = os.environ.get("SMTP_HOST")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
+SMTP_USERNAME = os.environ.get("SMTP_USERNAME")
+SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD")
 
 # Provider selected for new conversations when it has a key; otherwise the first one that does.
 DEFAULT_PROVIDER = os.environ.get("DEFAULT_PROVIDER", "openrouter")
@@ -63,3 +93,13 @@ MAX_AGENT_STEPS = int(os.environ.get("MAX_AGENT_STEPS", "12"))
 HTTP_HEADERS = {"User-Agent": "academic-paper-reader/0.1 (+https://github.com/)"}
 
 PAPERS_DIR.mkdir(parents=True, exist_ok=True)
+
+if not SECRET_KEY:
+    if ON_VERCEL:
+        raise RuntimeError("Set SECRET_KEY in the Vercel project's environment variables"
+                           " (e.g. the output of: python3 -c 'import secrets; print(secrets.token_urlsafe(32))')")
+    _secret_file = DATA_DIR / "secret_key"
+    if not _secret_file.exists():
+        import secrets
+        _secret_file.write_text(secrets.token_urlsafe(32))
+    SECRET_KEY = _secret_file.read_text().strip()

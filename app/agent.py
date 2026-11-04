@@ -6,7 +6,7 @@ from typing import AsyncIterator
 from . import db, usage
 from .config import MAX_AGENT_STEPS
 from .prompts import SEARCH_SYSTEM_PROMPT, SYSTEM_PROMPT, elements_text, paper_message_text, question_text
-from .providers import PROVIDERS, StepResult, TextDelta, ThinkingDelta
+from .providers import StepResult, TextDelta, ThinkingDelta, provider_for
 from .tools import TOOLS, run_tool
 
 
@@ -20,15 +20,15 @@ def build_user_message(question: str, selection: dict | None, first: bool, refs:
             "display": {"question": question, "selection": selection}}
 
 
-async def run_turn(conv: dict, question: str, selection: dict | None) -> AsyncIterator[dict]:
-    provider = PROVIDERS[conv["provider"]]
+async def run_turn(user: dict, conv: dict, question: str, selection: dict | None) -> AsyncIterator[dict]:
+    provider = provider_for(user["keys"], conv["provider"])
     # A search session (no paper_id) has no paper in context, only the search prompt.
-    paper = db.get_paper(conv["paper_id"], with_text=True) if conv["paper_id"] else None
+    paper = db.get_paper(user["id"], conv["paper_id"], with_text=True) if conv["paper_id"] else None
     paper_text = paper_message_text(paper) if paper else ""
     system = SYSTEM_PROMPT if paper else SEARCH_SYSTEM_PROMPT
 
     history = db.get_messages(conv["id"])
-    refs = None if history or not paper else (db.get_analysis(paper["id"], "refs") or {}).get("entries")
+    refs = None if history or not paper else (db.get_analysis(user["id"], paper["id"], "refs") or {}).get("entries")
     user_msg = build_user_message(question, selection, first=bool(paper) and not history, refs=refs)
     db.add_messages(conv["id"], [user_msg])
     messages = history + [user_msg]
@@ -52,7 +52,7 @@ async def run_turn(conv: dict, question: str, selection: dict | None) -> AsyncIt
                 else:
                     result = ev
 
-            await usage.record(conv["provider"], conv["model"], result.usage, kind="chat",
+            await usage.record(user["id"], conv["provider"], conv["model"], result.usage, kind="chat",
                                paper_id=conv["paper_id"], conversation_id=conv["id"])
             assistant = result.message
             assistant["display"] = {"thinking": "".join(thinking).strip(), "usage": result.usage,
@@ -69,7 +69,7 @@ async def run_turn(conv: dict, question: str, selection: dict | None) -> AsyncIt
 
             for tu in tool_uses:
                 yield {"type": "tool_call", "id": tu["id"], "name": tu["name"], "input": tu["input"]}
-            results = await asyncio.gather(*(run_tool(tu["name"], tu["input"]) for tu in tool_uses))
+            results = await asyncio.gather(*(run_tool(user, tu["name"], tu["input"]) for tu in tool_uses))
             tool_msg = {"role": "tool", "content": []}
             for tu, res in zip(tool_uses, results):
                 tool_msg["content"].append({

@@ -11,6 +11,8 @@ Replies are parsed while they stream: complete items are saved every few seconds
 "pending"), so the reader can use them before the reply ends. A reply cut off at the output limit
 is continued from the items it produced; if it stays incomplete, they are kept under a "failed"
 status and retry() continues from them.
+
+Each user has their own copy of a paper (db.py), analyzed on their own key (auth.user_keys).
 """
 
 import asyncio
@@ -27,28 +29,28 @@ from .providers import StepResult, TextDelta, ThinkingDelta, default_provider
 from .tools import TOOLS
 
 log = logging.getLogger(__name__)
-_tasks: dict[tuple[str, str], asyncio.Task] = {}
+_tasks: dict[tuple[str, str, str], asyncio.Task] = {}  # by (user id, paper id, analysis)
 TRUNCATED = {"length", "max_tokens", "MAX_TOKENS", "incomplete"}  # each provider's "hit the output limit"
 SAVE_EVERY = 2.0  # seconds between saves of a streaming reply's complete items
 
 
-def ensure(paper_id: str, retry_failed: bool = False):
+def ensure(user: dict, paper_id: str, retry_failed: bool = False):
     """Start each missing analysis in the background unless it exists or is already running."""
-    if default_provider() is None:
+    if default_provider(user["keys"]) is None:
         return
     for name in JOBS:
-        if (paper_id, name) in _tasks:
+        if (user["id"], paper_id, name) in _tasks:
             continue
-        current = db.get_analysis(paper_id, name) or {}
+        current = db.get_analysis(user["id"], paper_id, name) or {}
         status = current.get("status") or ""
         if (status == "ready" and not _outdated(name, current["entries"])) or (status.startswith("failed") and not retry_failed):
             continue
         # A "pending" left behind by a restart continues from the items it had saved.
-        _start(paper_id, name, resume=current["entries"] if resumable(name, current.get("entries")) else None)
+        _start(user, paper_id, name, resume=current["entries"] if resumable(name, current.get("entries")) else None)
 
 
-def running(paper_id: str) -> bool:
-    return any(pid == paper_id for pid, _ in _tasks)
+def running(user_id: str, paper_id: str) -> bool:
+    return any(key[:2] == (user_id, paper_id) for key in _tasks)
 
 
 def resumable(name: str, entries: dict | None) -> bool:
@@ -57,24 +59,25 @@ def resumable(name: str, entries: dict | None) -> bool:
     return bool(entries) and not _outdated(name, entries)
 
 
-def retry(paper_id: str, name: str) -> bool:
+def retry(user: dict, paper_id: str, name: str) -> bool:
     """Run an analysis again, continuing from the items it kept. False if it's running already."""
-    if default_provider() is None or (paper_id, name) in _tasks:
+    if default_provider(user["keys"]) is None or (user["id"], paper_id, name) in _tasks:
         return False
-    current = db.get_analysis(paper_id, name)
+    current = db.get_analysis(user["id"], paper_id, name)
     if current is None:
         return False
-    _start(paper_id, name, resume=current["entries"] if resumable(name, current["entries"]) else None)
+    _start(user, paper_id, name, resume=current["entries"] if resumable(name, current["entries"]) else None)
     return True
 
 
-def _start(paper_id: str, name: str, resume: dict | None):
+def _start(user: dict, paper_id: str, name: str, resume: dict | None):
     # The task first runs at the next await, so marking it pending afterwards is safe, and a
     # failure to start it leaves the status as it was.
-    task = asyncio.create_task(_generate(paper_id, name, resume or {}))
-    db.set_analysis(paper_id, name, "pending")
-    _tasks[paper_id, name] = task
-    task.add_done_callback(lambda _, key=(paper_id, name): _tasks.pop(key, None))
+    key = (user["id"], paper_id, name)
+    task = asyncio.create_task(_generate(user, paper_id, name, resume or {}))
+    db.set_analysis(user["id"], paper_id, name, "pending")
+    _tasks[key] = task
+    task.add_done_callback(lambda _, key=key: _tasks.pop(key, None))
 
 
 def _outdated(name: str, entries: dict) -> bool:
@@ -83,15 +86,16 @@ def _outdated(name: str, entries: dict) -> bool:
     return name == "refs" and any(e["kind"] in PROVABLE and "proof" not in e for e in entries.values())
 
 
-async def _generate(paper_id: str, name: str, base: dict):
+async def _generate(user: dict, paper_id: str, name: str, base: dict):
     """base: items kept from an earlier, cut-off run, which the model is asked to continue."""
     prompt, parse = JOBS[name]
-    provider = default_provider()
+    user_id = user["id"]
+    provider = default_provider(user["keys"])
     model = DEFAULT_MODELS[provider.id]
-    paper = db.get_paper(paper_id, with_text=True)
+    paper = db.get_paper(user_id, paper_id, with_text=True)
     paper_text = paper_message_text(paper)
     # Starting over (an outdated index): the old entries stay usable until new ones replace them.
-    keep = {} if base else (db.get_analysis(paper_id, name) or {}).get("entries") or {}
+    keep = {} if base else (db.get_analysis(user_id, paper_id, name) or {}).get("entries") or {}
     try:
         for attempt in range(3):
             # Same system prompt, tools and paper block as a conversation, so this call also warms
@@ -110,12 +114,12 @@ async def _generate(paper_id: str, name: str, base: dict):
                         partial = parse("".join(chunks), paper["text"])
                         if len(partial) > saved:
                             saved = len(partial)
-                            _save(paper_id, name, "pending", {**keep, **_merge(name, base, partial)})
+                            _save(user_id, paper_id, name, "pending", {**keep, **_merge(name, base, partial)})
                 elif isinstance(ev, ThinkingDelta):
                     thinking += len(ev.text)
                 elif isinstance(ev, StepResult):
                     result = ev
-            await usage.record(provider.id, model, result.usage, kind="analysis", paper_id=paper_id)
+            await usage.record(user_id, provider.id, model, result.usage, kind="analysis", paper_id=paper_id)
             text ="".join(b["text"] for b in result.message["content"] if b["type"] == "text")
             sizes = f"{len(text)} chars of reply, {thinking} of reasoning, {result.usage.get('output', 0)} output tokens"
             entries = parse(text, paper["text"])
@@ -124,25 +128,25 @@ async def _generate(paper_id: str, name: str, base: dict):
                 entries = dict(base)
             if entries and not truncated:
                 entries = _merge(name, base, entries)
-                _save(paper_id, name, "ready", entries)
+                _save(user_id, paper_id, name, "ready", entries)
                 log.info("%s for %s: %d entries (%s %s)", name, paper_id, len(entries), provider.id, model)
                 return
             if entries:  # cut off: continue after the items it produced
                 base = _merge(name, base, entries)
-                _save(paper_id, name, "pending", {**keep, **base})
+                _save(user_id, paper_id, name, "pending", {**keep, **base})
                 log.warning("%s for %s: cut off at the output limit with %d items (attempt %d; %s)",
                             name, paper_id, len(base), attempt + 1, sizes)
             else:
                 log.warning("%s for %s: unparseable reply (attempt %d, stop=%s; %s)",
                             name, paper_id, attempt + 1, result.stop_reason, sizes)
         if base:  # (replacing any outdated entries, so that a retry continues from these)
-            _save(paper_id, name, f"failed: the reply was still cut off at the output limit ({len(base)} items kept)", base)
+            _save(user_id, paper_id, name, f"failed: the reply was still cut off at the output limit ({len(base)} items kept)", base)
         else:
-            db.set_analysis(paper_id, name, "failed: the model did not return valid JSON")
+            db.set_analysis(user_id, paper_id, name, "failed: the model did not return valid JSON")
     except Exception as e:
         log.exception("%s for %s failed", name, paper_id)
         # Whatever streamed before the error was saved as it arrived, so it's kept for a retry.
-        db.set_analysis(paper_id, name, f"failed: {type(e).__name__}: {e}"[:500])
+        db.set_analysis(user_id, paper_id, name, f"failed: {type(e).__name__}: {e}"[:500])
 
 
 def _merge(name: str, base: dict, new: dict) -> dict:
@@ -172,15 +176,15 @@ def _continuation(name: str, base: dict) -> str:
                                   shape="object" if name == "glossary" else "array")
 
 
-def _save(paper_id: str, name: str, status: str, entries: dict):
+def _save(user_id: str, paper_id: str, name: str, status: str, entries: dict):
     """Saves entries, keeping the arXiv lookups resolve_bib already made for bibliography entries."""
     if name == "bib":
-        current = (db.get_analysis(paper_id, "bib") or {}).get("entries") or {}
+        current = (db.get_analysis(user_id, paper_id, "bib") or {}).get("entries") or {}
         for k, e in entries.items():
             c = current.get(k)
             if c and c.get("lookup") and not e.get("lookup") and c["title"] == e["title"]:
                 e["arxiv_id"], e["lookup"] = c["arxiv_id"], c["lookup"]
-    db.set_analysis(paper_id, name, status, entries)
+    db.set_analysis(user_id, paper_id, name, status, entries)
 
 
 def _empty_json(text: str) -> bool:
@@ -350,14 +354,14 @@ JOBS = {
     "bib": (BIB_PROMPT, parse_bib),
 }
 
-_bib_locks: dict[str, asyncio.Lock] = {}
+_bib_locks: dict[tuple[str, str], asyncio.Lock] = {}
 
 
-async def resolve_bib(paper_id: str, ids: list[str]) -> dict[str, dict]:
+async def resolve_bib(user_id: str, paper_id: str, ids: list[str]) -> dict[str, dict]:
     """Find arXiv IDs for the given bibliography entries by title search, caching the outcome
     (an ID, or "none") in the paper's bib so each entry is searched at most once."""
-    async with _bib_locks.setdefault(paper_id, asyncio.Lock()):
-        bib = (db.get_analysis(paper_id, "bib") or {}).get("entries") or {}
+    async with _bib_locks.setdefault((user_id, paper_id), asyncio.Lock()):
+        bib = (db.get_analysis(user_id, paper_id, "bib") or {}).get("entries") or {}
         found = {}
         for i in ids:
             e = bib.get(i)
@@ -379,11 +383,11 @@ async def resolve_bib(paper_id: str, ids: list[str]) -> dict[str, dict]:
             found[i] = (e["title"], *((best[1]["arxiv_id"], "arxiv") if best else (None, "none")))
         # The bibliography may still be streaming in: apply the lookups to the current entries and
         # keep its status.
-        current = db.get_analysis(paper_id, "bib") or {}
+        current = db.get_analysis(user_id, paper_id, "bib") or {}
         bib = current.get("entries") or {}
         for i, (title, arxiv_id, lookup) in found.items():
             if i in bib and bib[i]["title"] == title:
                 bib[i]["arxiv_id"], bib[i]["lookup"] = arxiv_id, lookup
         if found:
-            db.set_analysis(paper_id, "bib", current["status"], bib)
+            db.set_analysis(user_id, paper_id, "bib", current["status"], bib)
         return {i: bib[i] for i in ids if i in bib}

@@ -17,7 +17,8 @@
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.css">
   <link rel="stylesheet" href="/static/styles.css">
 </head>
-<body>
+<body class="signed-out">
+  <div id="auth" class="auth" hidden></div>
   <div id="app">
     <aside id="sidebar">
       <div class="sidebar-head">
@@ -37,7 +38,14 @@
       <div class="sidebar-foot">
         <div id="settings-wrap" class="settings-wrap">
           <div id="settings-pop" class="settings-pop" hidden>
-            <div class="settings-pop-head">Model</div>
+            <div class="settings-pop-head">Account</div>
+            <div id="account-summary" class="account-summary muted"></div>
+            <div class="account-actions">
+              <button id="account-btn" type="button" title="Your account and API keys">API keys…</button>
+              <button id="tour-btn" type="button" title="Show the walkthrough of the app again">Walkthrough</button>
+              <button id="signout-btn" type="button">Sign out</button>
+            </div>
+            <div class="settings-pop-head settings-pop-sep">Model</div>
             <label class="setting">Provider <select id="provider"></select></label>
             <label class="setting">Model <input id="model" list="model-list" spellcheck="false"></label>
             <datalist id="model-list"></datalist>
@@ -153,6 +161,11 @@
       <div id="messages" class="messages">
         <div class="chat-empty muted" id="chat-empty">Highlight text in the paper to ask about it, or ask about the whole paper below.</div>
       </div>
+      <div id="key-callout" class="key-callout" hidden>
+        <p><strong>Add an API key to ask questions.</strong> Paper Reader runs on your own key for a model
+          provider. OpenRouter is the quickest: one key works with every vendor's models.</p>
+        <button id="key-callout-btn" type="button">Add a key</button>
+      </div>
       <form id="composer">
         <div id="pending-selection" class="pending-selection" hidden></div>
         <div class="composer-row">
@@ -186,6 +199,17 @@
       <div id="elements-kinds" class="element-kinds"></div>
       <div id="elements-list" class="elements-list"></div>
       <div id="elements-empty" class="muted notation-empty" hidden>No matching elements.</div>
+    </div>
+  </div>
+
+  <div id="account-modal" class="modal-backdrop" hidden>
+    <div class="modal account-modal" role="dialog" aria-modal="true" aria-labelledby="account-title">
+      <header class="modal-head">
+        <h2 id="account-title">Account</h2>
+        <span class="modal-head-fill"></span>
+        <button id="account-close" type="button" class="modal-close" title="Close (Esc)">×</button>
+      </header>
+      <div id="account-body" class="account-body"></div>
     </div>
   </div>
 

@@ -1,10 +1,12 @@
 """Copies the local database (data/app.db) into the Turso database named by TURSO_DATABASE_URL and
-TURSO_AUTH_TOKEN (from .env or the environment). A one-off, for moving to Vercel: see "Deploying
-to Vercel" in the README.
+TURSO_AUTH_TOKEN (from .env or the environment; the app itself uses them only in production, see
+USE_TURSO in config.py). A one-off, for moving to Vercel: see "Deploying to Vercel" in the README.
 
 It works on a copy, so data/app.db is left as it was. The copy is
 - brought to the app's current schema (db.init);
 - cleaned of NUL characters in paper text (libsql cuts strings at them);
+- disowned: accounts aren't copied (their ids, passwords and sessions belong to each database), so
+  the library goes up without an owner, and the first admin to sign in to the app on Turso gets it;
 - pinned: papers added before the app recorded their PDF get its URL (for arXiv, with the version)
   and the SHA-256 of the file saved in data/papers. An arXiv version that came out before the paper
   was added is the one it was read from; any other is downloaded to check it's that file.
@@ -19,6 +21,7 @@ alone.
 import argparse
 import asyncio
 import hashlib
+import os
 import shutil
 import sqlite3
 import sys
@@ -32,6 +35,7 @@ from app import config, db, papers  # noqa: E402
 from app.turso import Connection  # noqa: E402
 
 TABLES = ("folders", "papers", "conversations", "messages", "usage")  # parents before children
+OWNED = ("folders", "papers", "conversations", "usage")  # the tables with a user_id
 
 
 def init_schema(path=None, url=None, token=None):
@@ -46,6 +50,16 @@ def drop_nuls(copy: sqlite3.Connection):
     copy.executemany("UPDATE papers SET text = ? WHERE id = ?", fixed)
     copy.commit()
     print(f"Dropped NUL characters from the text of {len(fixed)} papers")
+
+
+def disown(copy: sqlite3.Connection):
+    owners = {r[0] for t in OWNED for r in copy.execute(f"SELECT DISTINCT user_id FROM {t}")} - {""}
+    if len(owners) > 1:
+        sys.exit(f"The local database holds the libraries of {len(owners)} accounts; this copies one person's.")
+    for table in OWNED:
+        copy.execute(f"UPDATE {table} SET user_id = ''")
+    copy.commit()
+    print("The library goes up without an owner: the first admin to sign in gets it")
 
 
 async def pin(copy: sqlite3.Connection, pdf_dir: Path):
@@ -100,7 +114,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--replace", action="store_true", help="delete what the Turso database holds first")
     args = parser.parse_args()
-    url, token = config.TURSO_DATABASE_URL, config.TURSO_AUTH_TOKEN
+    url, token = os.environ.get("TURSO_DATABASE_URL"), os.environ.get("TURSO_AUTH_TOKEN")
     if not url:
         sys.exit("Set TURSO_DATABASE_URL and TURSO_AUTH_TOKEN (in .env) to the Turso database first.")
     if not config.DB_PATH.exists():
@@ -113,6 +127,7 @@ def main():
         init_schema(path=path)
         copy = sqlite3.connect(path)
         drop_nuls(copy)
+        disown(copy)
         asyncio.run(pin(copy, config.PAPERS_DIR))
 
         print(f"Connecting to {url}")

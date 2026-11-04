@@ -8,7 +8,7 @@ import httpx
 from bs4 import BeautifulSoup
 
 from . import papers
-from .config import HTTP_HEADERS, TAVILY_API_KEY
+from .config import HTTP_HEADERS
 
 MAX_TOOL_CHARS = 40_000
 
@@ -81,13 +81,13 @@ def _clip(text: str, offset: int = 0) -> str:
     return chunk
 
 
-async def web_search(query: str, max_results: int = 5) -> ToolResult:
+async def web_search(user: dict, query: str, max_results: int = 5) -> ToolResult:
     max_results = max(1, min(int(max_results or 5), 10))
-    if TAVILY_API_KEY:
+    if tavily_key := user["keys"].get("tavily"):
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.post(
                 "https://api.tavily.com/search",
-                json={"api_key": TAVILY_API_KEY, "query": query, "max_results": max_results},
+                json={"api_key": tavily_key, "query": query, "max_results": max_results},
             )
             r.raise_for_status()
         hits = [{"title": h["title"], "url": h["url"], "snippet": h.get("content", "")}
@@ -118,9 +118,9 @@ def _html_to_text(html: str) -> str:
     return (f"# {title}\n\n" if title else "") + text.strip()
 
 
-async def fetch_url(url: str) -> ToolResult:
+async def fetch_url(user: dict, url: str) -> ToolResult:
     if papers.parse_arxiv_id(url) and "arxiv.org" in url:
-        return await read_arxiv_paper(papers.parse_arxiv_id(url))
+        return await read_arxiv_paper(user, papers.parse_arxiv_id(url))
     async with httpx.AsyncClient(headers=HTTP_HEADERS, timeout=30, follow_redirects=True) as client:
         r = await client.get(url)
         r.raise_for_status()
@@ -134,7 +134,7 @@ async def fetch_url(url: str) -> ToolResult:
     return ToolResult(_clip(text))
 
 
-async def search_arxiv(query: str, max_results: int = 5) -> ToolResult:
+async def search_arxiv(user: dict, query: str, max_results: int = 5) -> ToolResult:
     results = await papers.search_arxiv(query, max(1, min(int(max_results or 5), 10)))
     if not results:
         return ToolResult("No arXiv results.")
@@ -144,12 +144,12 @@ async def search_arxiv(query: str, max_results: int = 5) -> ToolResult:
     )
 
 
-async def read_arxiv_paper(arxiv_id: str, offset: int = 0) -> ToolResult:
+async def read_arxiv_paper(user: dict, arxiv_id: str, offset: int = 0) -> ToolResult:
     parsed = papers.parse_arxiv_id(arxiv_id)
     if not parsed:
         return ToolResult(f"'{arxiv_id}' is not a valid arXiv ID", is_error=True)
-    paper = await papers.ingest(parsed)  # also stores it, so "open in reader" is instant
-    full = papers.db.get_paper(paper["id"], with_text=True)
+    paper = await papers.ingest(user["id"], parsed)  # also stores it, so "open in reader" is instant
+    full = papers.db.get_paper(user["id"], paper["id"], with_text=True)
     header = f"Title: {full['title']}\nAuthors: {', '.join(full['authors'])}\n\n"
     return ToolResult(
         header + _clip(full["text"], int(offset or 0)),
@@ -165,14 +165,15 @@ _IMPLS = {
 }
 
 
-async def run_tool(name: str, args: dict) -> ToolResult:
+async def run_tool(user: dict, name: str, args: dict) -> ToolResult:
+    """Runs a tool for the user whose chat called it (their library, their search key)."""
     impl = _IMPLS.get(name)
     if impl is None:
         return ToolResult(f"Unknown tool: {name}", is_error=True)
     if not isinstance(args, dict):
         return ToolResult("Tool input must be a JSON object", is_error=True)
     try:
-        return await impl(**args)
+        return await impl(user, **args)
     except TypeError as e:
         return ToolResult(f"Invalid arguments for {name}: {e}", is_error=True)
     except Exception as e:  # tool failures go back to the model, not up the stack

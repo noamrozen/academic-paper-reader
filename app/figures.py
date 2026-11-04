@@ -20,27 +20,28 @@ CAPTION_RE = re.compile(r"^\s*(?:Figure|Fig\.?|Table)\s*[A-Z]?\d+(?:\.\d+)*\s*[:
 PAD = 6
 
 
-def crops_dir(paper_id: str):
-    return CROPS_DIR / paper_id.replace("/", "_")
+def crops_dir(paper: dict):
+    """Named like the PDF (papers.pdf_path): by its hash, shared by every user's copy."""
+    return CROPS_DIR / papers.pdf_path(paper).stem
 
 
-def crop_path(paper_id: str, kind: str, number: str):
-    return crops_dir(paper_id) / f"{kind}-{number}.png"
+def crop_path(paper: dict, kind: str, number: str):
+    return crops_dir(paper) / f"{kind}-{number}.png"
 
 
-def crop(paper_id: str, kind: str, number: str, page_hint: int | None) -> bytes | None:
+def crop(paper: dict, kind: str, number: str, page_hint: int | None) -> bytes | None:
     """PNG of the figure/table, cached on disk; None when it can't be located."""
-    path = crop_path(paper_id, kind, number)
+    path = crop_path(paper, kind, number)
     if path.exists():
         return path.read_bytes() or None  # an empty file caches "not found"
-    png = _render(paper_id, kind, number, page_hint)
+    png = _render(paper, kind, number, page_hint)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(png or b"")
     return png
 
 
-def _render(paper_id, kind, number, page_hint):
-    pdf = papers.pdf_path(paper_id)
+def _render(paper, kind, number, page_hint):
+    pdf = papers.pdf_path(paper)
     if kind not in _KIND_WORDS or not pdf.exists():
         return None
     caption_re = re.compile(rf"^\s*{_KIND_WORDS[kind]}\s*{re.escape(number)}\s*[:.|]", re.I)

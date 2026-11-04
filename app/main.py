@@ -7,14 +7,17 @@ from fastapi.responses import FileResponse, RedirectResponse, Response, Streamin
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import analysis, db, figures, papers, transcribe, usage
+from . import analysis, auth, db, figures, papers, transcribe, usage
 from .agent import run_turn
+from .auth import User
 from .config import DEFAULT_MODELS, ON_VERCEL, STATIC_DIR, VOICE_END_SILENCE
-from .providers import PROVIDERS, default_provider
+from .crypto import token_hash
+from .providers import PROVIDERS, default_provider, provider_for
 
 db.init()
 app = FastAPI(title="Academic Paper Reader")
-_model_cache: dict[str, list[str]] = {}
+app.include_router(auth.router)
+_model_cache: dict[tuple[str, str], list[str]] = {}  # (provider, hash of the key) -> models
 _arxiv_titles: dict[str, str | None] = {}  # arXiv ID -> title (None: no such paper)
 MAX_PHRASE_BYTES = 2 * 60 * 16000 * 2  # two minutes of 16 kHz 16-bit audio
 
@@ -76,42 +79,45 @@ class ConversationPatch(BaseModel):
 
 
 @app.get("/api/config")
-def config():
-    return {"default_provider": (p := default_provider()) and p.id, "providers": [
-        {"id": p.id, "label": p.label, "available": p.available(), "default_model": DEFAULT_MODELS[p.id]}
+def config(user: User):
+    """The providers the user has a key for (theirs, or the server's for an admin), and voice."""
+    return {"default_provider": (p := default_provider(user["keys"])) and p.id, "providers": [
+        {"id": p.id, "label": p.label, "available": bool(user["keys"].get(p.id)), "default_model": DEFAULT_MODELS[p.id]}
         for p in PROVIDERS.values()
-    ], "voice": {"end_silence": VOICE_END_SILENCE} if transcribe.available() else None}
+    ], "voice": {"end_silence": VOICE_END_SILENCE} if transcribe.available(user) else None,
+       "user": auth.public(user)}
 
 
 @app.get("/api/providers/{provider_id}/models")
-async def models(provider_id: str):
-    p = PROVIDERS.get(provider_id)
-    if not p or not p.available():
+async def models(provider_id: str, user: User):
+    p = provider_for(user["keys"], provider_id)
+    if not p:
         raise HTTPException(404, "Provider not configured")
-    if provider_id not in _model_cache:
+    key = (provider_id, token_hash(user["keys"][provider_id]))  # what a key can see differs by account
+    if key not in _model_cache:
         try:
-            _model_cache[provider_id] = await p.list_models()
+            _model_cache[key] = await p.list_models()
         except Exception as e:
             raise HTTPException(502, f"Could not list models: {e}")
-    return {"models": _model_cache[provider_id]}
+    return {"models": _model_cache[key]}
 
 
 @app.post("/api/papers")
-async def add_paper(body: PaperIn):
+async def add_paper(body: PaperIn, user: User):
     try:
-        paper = await papers.ingest(body.url, body.model_dump(exclude={"url"}))
+        paper = await papers.ingest(user["id"], body.url, body.model_dump(exclude={"url"}))
     except papers.PaperError as e:
         raise HTTPException(400, str(e))
     except Exception as e:
         raise HTTPException(502, f"Failed to load paper: {e}")
     # Covers new papers and papers ingested before an analysis existed. Failed analyses wait for
     # an explicit retry (each one re-reads the whole paper).
-    analysis.ensure(paper["id"])
+    analysis.ensure(user, paper["id"])
     return paper
 
 
 @app.get("/api/search")
-async def search(q: str):
+async def search(q: str, user: User):
     """Papers matching a name. Only results with an arXiv copy (arxiv_id set) can be opened."""
     if not q.strip():
         return {"results": []}
@@ -122,7 +128,7 @@ async def search(q: str):
 
 
 @app.get("/api/arxiv/titles")
-async def arxiv_titles(ids: str):
+async def arxiv_titles(ids: str, user: User):
     """Titles for arXiv IDs, so the UI can show what each paper link really points to."""
     wanted = {i: papers.parse_arxiv_id(i) for i in ids.split(",")[:50] if i.strip()}
     missing = sorted({a for a in wanted.values() if a and a not in _arxiv_titles})
@@ -138,13 +144,13 @@ async def arxiv_titles(ids: str):
 
 
 @app.get("/api/papers")
-def list_papers():
-    return db.list_papers()
+def list_papers(user: User):
+    return db.list_papers(user["id"])
 
 
 @app.get("/api/folders")
-def list_folders():
-    return db.list_folders()
+def list_folders(user: User):
+    return db.list_folders(user["id"])
 
 
 def _folder_name(body: FolderIn | FolderPatch) -> str:
@@ -155,71 +161,75 @@ def _folder_name(body: FolderIn | FolderPatch) -> str:
 
 
 @app.post("/api/folders")
-def create_folder(body: FolderIn):
-    if body.parent_id and body.parent_id not in {f["id"] for f in db.list_folders()}:
+def create_folder(body: FolderIn, user: User):
+    if body.parent_id and body.parent_id not in {f["id"] for f in db.list_folders(user["id"])}:
         raise HTTPException(400, "Unknown parent folder")
-    return db.create_folder(_folder_name(body), body.parent_id)
+    return db.create_folder(user["id"], _folder_name(body), body.parent_id)
 
 
 @app.patch("/api/folders/{folder_id}")
-def update_folder(folder_id: str, body: FolderPatch):
+def update_folder(folder_id: str, body: FolderPatch, user: User):
     """Renames the folder and/or moves it into another folder (parent_id null: to the top level)."""
-    if folder_id not in {f["id"] for f in db.list_folders()}:
+    folder_ids = {f["id"] for f in db.list_folders(user["id"])}
+    if folder_id not in folder_ids:
         raise HTTPException(404)
     if "parent_id" in body.model_fields_set:
         if body.parent_id:
-            if body.parent_id not in {f["id"] for f in db.list_folders()}:
+            if body.parent_id not in folder_ids:
                 raise HTTPException(400, "Unknown parent folder")
-            if body.parent_id in db.folder_subtree_ids(folder_id):
+            if body.parent_id in db.folder_subtree_ids(user["id"], folder_id):
                 raise HTTPException(400, "Can't move a folder into itself or one of its subfolders")
-        db.set_folder_parent(folder_id, body.parent_id)
+        db.set_folder_parent(user["id"], folder_id, body.parent_id)
     if body.name is not None:
-        db.rename_folder(folder_id, _folder_name(body))
+        db.rename_folder(user["id"], folder_id, _folder_name(body))
     return {"ok": True}
 
 
 @app.delete("/api/folders/{folder_id}")
-def delete_folder(folder_id: str, with_papers: bool = False):
+def delete_folder(folder_id: str, user: User, with_papers: bool = False):
     """Deletes the folder; its papers and subfolders move up to its parent, or with
     ?with_papers=true the subfolders and every paper in them are deleted too."""
     if with_papers:
-        for paper_id in db.folder_paper_ids(folder_id):
-            _delete_paper(paper_id)
-        db.delete_folder_tree(folder_id)
+        for paper_id in db.folder_paper_ids(user["id"], folder_id):
+            _delete_paper(user["id"], paper_id)
+        db.delete_folder_tree(user["id"], folder_id)
     else:
-        db.delete_folder(folder_id)
+        db.delete_folder(user["id"], folder_id)
     return {"ok": True}
 
 
-def _delete_paper(paper_id: str) -> bool:
-    if not db.delete_paper(paper_id):
+def _delete_paper(user_id: str, paper_id: str) -> bool:
+    paper = db.get_paper(user_id, paper_id)
+    if not paper or not db.delete_paper(user_id, paper_id):
         return False
-    papers.pdf_path(paper_id).unlink(missing_ok=True)
-    shutil.rmtree(figures.crops_dir(paper_id), ignore_errors=True)
+    # The cached files are shared by every user's copy of the same PDF.
+    if not (paper.get("pdf_sha256") and db.pdf_in_use(paper["pdf_sha256"])):
+        papers.pdf_path(paper).unlink(missing_ok=True)
+        shutil.rmtree(figures.crops_dir(paper), ignore_errors=True)
     return True
 
 
 @app.delete("/api/papers/{paper_id:path}")
-def delete_paper(paper_id: str):
+def delete_paper(paper_id: str, user: User):
     """Deletes the paper, its conversations, its PDF and cached figure crops."""
-    if not _delete_paper(paper_id):
+    if not _delete_paper(user["id"], paper_id):
         raise HTTPException(404)
     return {"ok": True}
 
 
 @app.patch("/api/papers/{paper_id:path}")
-def move_paper(paper_id: str, body: PaperPatch):
-    if body.folder_id and body.folder_id not in {f["id"] for f in db.list_folders()}:
+def move_paper(paper_id: str, body: PaperPatch, user: User):
+    if body.folder_id and body.folder_id not in {f["id"] for f in db.list_folders(user["id"])}:
         raise HTTPException(400, "Unknown folder")
-    if not db.set_paper_folder(paper_id, body.folder_id):
+    if not db.set_paper_folder(user["id"], paper_id, body.folder_id):
         raise HTTPException(404)
-    return db.get_paper(paper_id)
+    return db.get_paper(user["id"], paper_id)
 
 
 @app.get("/api/papers/{paper_id:path}/newer")
-async def paper_newer(paper_id: str):
+async def paper_newer(paper_id: str, user: User):
     """{"version": n} when arXiv has a newer version of the paper than the one in the library."""
-    paper = db.get_paper(paper_id)
+    paper = db.get_paper(user["id"], paper_id)
     if not paper:
         raise HTTPException(404)
     try:
@@ -229,24 +239,24 @@ async def paper_newer(paper_id: str):
 
 
 @app.post("/api/papers/{paper_id:path}/update")
-async def update_paper(paper_id: str):
+async def update_paper(paper_id: str, user: User):
     """Replaces the paper with its latest arXiv version, processed like a new paper; the version
     it was moves to the Archive folder with its conversations."""
-    if analysis.running(paper_id):
+    if analysis.running(user["id"], paper_id):
         raise HTTPException(409, "Wait until this paper's analysis is done")
     try:
-        paper = await papers.update_to_latest(paper_id)
+        paper = await papers.update_to_latest(user["id"], paper_id)
     except papers.PaperError as e:
         raise HTTPException(400, str(e))
     except Exception as e:
         raise HTTPException(502, f"Failed to get the new version: {e}")
-    analysis.ensure(paper["id"])
+    analysis.ensure(user, paper["id"])
     return paper
 
 
 @app.get("/api/papers/{paper_id:path}/pdf")
-async def paper_pdf(paper_id: str, sha: str | None = None):
-    paper = db.get_paper(paper_id)
+async def paper_pdf(paper_id: str, user: User, sha: str | None = None):
+    paper = db.get_paper(user["id"], paper_id)
     if not paper:
         raise HTTPException(404)
     # Vercel caps a response at 4.5 MB, smaller than many papers: the browser gets arXiv PDFs from
@@ -266,46 +276,46 @@ async def paper_pdf(paper_id: str, sha: str | None = None):
 
 
 @app.post("/api/papers/{paper_id:path}/bib/resolve")
-async def resolve_bib(paper_id: str, body: BibResolveIn):
+async def resolve_bib(paper_id: str, body: BibResolveIn, user: User):
     """arXiv IDs for selected citations, looked up on first use and cached."""
-    return await analysis.resolve_bib(paper_id, body.ids[:20])
+    return await analysis.resolve_bib(user["id"], paper_id, body.ids[:20])
 
 
 @app.get("/api/papers/{paper_id:path}/crop")
-async def paper_crop(paper_id: str, kind: str, number: str):
+async def paper_crop(paper_id: str, kind: str, number: str, user: User):
     """PNG of a figure or table cropped from the PDF (located by its caption), cached on disk."""
-    paper = db.get_paper(paper_id)
+    paper = db.get_paper(user["id"], paper_id)
     if kind not in ("figure", "table") or not paper:
         raise HTTPException(404)
-    if not figures.crop_path(paper_id, kind, number).exists():
+    if not figures.crop_path(paper, kind, number).exists():
         try:
             await papers.ensure_pdf(paper)
         except papers.PaperError as e:
             raise HTTPException(409, str(e))
         except Exception as e:
             raise HTTPException(502, f"Could not download the PDF: {e}")
-    refs = (db.get_analysis(paper_id, "refs") or {}).get("entries") or {}
+    refs = (db.get_analysis(user["id"], paper_id, "refs") or {}).get("entries") or {}
     page = (refs.get(f"{kind} {number.upper()}") or {}).get("page")
-    png = await asyncio.to_thread(figures.crop, paper_id, kind, number, page)
+    png = await asyncio.to_thread(figures.crop, paper, kind, number, page)
     if not png:
         raise HTTPException(404, "Could not locate it in the PDF")
     return Response(png, media_type="image/png", headers={"Cache-Control": "max-age=86400"})
 
 
 @app.post("/api/papers/{paper_id:path}/analysis/{name}/retry")
-async def retry_analysis(paper_id: str, name: str):
+async def retry_analysis(paper_id: str, name: str, user: User):
     """Runs a lookup again, continuing from the items it kept. (Async: it starts a task on the event loop.)"""
-    if name not in db.ANALYSES or not db.get_paper(paper_id):
+    if name not in db.ANALYSES or not db.get_paper(user["id"], paper_id):
         raise HTTPException(404)
-    if not analysis.retry(paper_id, name):
-        raise HTTPException(409, "It is already running, or no model is configured")
+    if not analysis.retry(user, paper_id, name):
+        raise HTTPException(409, "It is already running, or you have no API key yet (Settings → Account)")
     return {"ok": True}
 
 
 @app.get("/api/papers/{paper_id:path}/analysis")
-def paper_analysis(paper_id: str):
+def paper_analysis(paper_id: str, user: User):
     """Model-generated lookups for the reader: {"glossary"|"refs"|"bib": {status, entries, resumable}}."""
-    out = {name: db.get_analysis(paper_id, name) for name in db.ANALYSES}
+    out = {name: db.get_analysis(user["id"], paper_id, name) for name in db.ANALYSES}
     if out["glossary"] is None:
         raise HTTPException(404)
     for name, a in out.items():
@@ -314,23 +324,28 @@ def paper_analysis(paper_id: str):
 
 
 @app.get("/api/papers/{paper_id:path}")
-def get_paper(paper_id: str):
-    paper = db.get_paper(paper_id)
+def get_paper(paper_id: str, user: User):
+    paper = db.get_paper(user["id"], paper_id)
     if not paper:
         raise HTTPException(404)
     return paper
 
 
 @app.get("/api/conversations")
-def list_conversations(paper_id: str | None = None):
-    return db.list_conversations(paper_id)
+def list_conversations(user: User, paper_id: str | None = None):
+    return db.list_conversations(user["id"], paper_id)
+
+
+def _conversation(user: dict, conv_id: str) -> dict:
+    conv = db.get_conversation(user["id"], conv_id)
+    if not conv:
+        raise HTTPException(404, "Conversation not found")
+    return conv
 
 
 @app.get("/api/conversations/{conv_id}")
-def get_conversation(conv_id: str):
-    conv = db.get_conversation(conv_id)
-    if not conv:
-        raise HTTPException(404)
+def get_conversation(conv_id: str, user: User):
+    conv = _conversation(user, conv_id)
     msgs = db.get_messages(conv_id)
     for m in msgs:
         m.pop("raw", None)
@@ -338,37 +353,39 @@ def get_conversation(conv_id: str):
 
 
 @app.patch("/api/conversations/{conv_id}")
-def patch_conversation(conv_id: str, body: ConversationPatch):
+def patch_conversation(conv_id: str, body: ConversationPatch, user: User):
     if body.provider and body.provider not in PROVIDERS:
         raise HTTPException(400, "Unknown provider")
-    db.update_conversation(conv_id, **body.model_dump())
-    return db.get_conversation(conv_id)
+    _conversation(user, conv_id)
+    db.update_conversation(user["id"], conv_id, **body.model_dump())
+    return db.get_conversation(user["id"], conv_id)
 
 
 @app.delete("/api/conversations/{conv_id}")
-def delete_conversation(conv_id: str):
-    db.delete_conversation(conv_id)
+def delete_conversation(conv_id: str, user: User):
+    db.delete_conversation(user["id"], conv_id)
     return {"ok": True}
 
 
 @app.get("/api/usage")
-async def usage_summary(tz: str | None = None):
-    """Spending on model calls per day, week and month (in the time zone tz), with any budgets."""
-    return await usage.summary(tz)
+async def usage_summary(user: User, tz: str | None = None):
+    """The user's spending on model calls per day, week and month (in the time zone tz), with any budgets."""
+    return await usage.summary(user, tz)
 
 
 @app.post("/api/transcribe")
-async def transcribe_phrase(request: Request, paper_id: str | None = None, context: str = "", draft: bool = False):
+async def transcribe_phrase(request: Request, user: User, paper_id: str | None = None, context: str = "",
+                            draft: bool = False):
     """One phrase of a voice question, as 16 kHz 16-bit mono PCM: its text. context is the question's
     text so far; draft asks for a quick draft of a phrase still being spoken. With paper_id, the
     paper's terms guide spelling."""
-    if not transcribe.available():
-        raise HTTPException(400, "Voice questions need OPENROUTER_API_KEY")
+    if not transcribe.available(user):
+        raise HTTPException(400, "Voice questions need an OpenRouter key (Settings → Account)")
     pcm = await request.body()
     if len(pcm) > MAX_PHRASE_BYTES:
         raise HTTPException(413, "Recording too long")
     try:
-        return {"text": await transcribe.transcribe(pcm, paper_id=paper_id, context=context, draft=draft)}
+        return {"text": await transcribe.transcribe(user, pcm, paper_id=paper_id, context=context, draft=draft)}
     except Exception as e:
         raise HTTPException(502, f"Transcription failed: {e or type(e).__name__}")
 
@@ -378,33 +395,34 @@ def _sse(event: dict) -> str:
 
 
 @app.post("/api/chat")
-async def chat(body: ChatIn):
+async def chat(body: ChatIn, user: User):
+    if body.provider and body.provider not in PROVIDERS:
+        raise HTTPException(400, "Unknown provider")
     if body.conversation_id:
-        conv = db.get_conversation(body.conversation_id)
-        if not conv:
-            raise HTTPException(404, "Conversation not found")
+        conv = _conversation(user, body.conversation_id)
         if (body.provider and body.provider != conv["provider"]) or (body.model and body.model != conv["model"]):
-            db.update_conversation(conv["id"], provider=body.provider, model=body.model)
-            conv = db.get_conversation(conv["id"])
+            db.update_conversation(user["id"], conv["id"], provider=body.provider, model=body.model)
+            conv = db.get_conversation(user["id"], conv["id"])
     else:
         # Without a paper_id this starts a search session: a chat with no paper in context.
-        if body.paper_id and not db.get_paper(body.paper_id):
+        if body.paper_id and not db.get_paper(user["id"], body.paper_id):
             raise HTTPException(400, "Unknown paper")
-        provider = body.provider or ((p := default_provider()) and p.id)
-        if not provider:
-            raise HTTPException(400, "No LLM provider configured; set an API key in .env")
+        provider = body.provider or ((p := default_provider(user["keys"])) and p.id)
+        if not provider_for(user["keys"], provider):
+            raise HTTPException(400, "Add an API key first: Settings → Account")
         title = (body.question.strip() or (body.selection.text if body.selection else "")).strip()
         title = title[:80] + ("…" if len(title) > 80 else "")
-        conv = db.create_conversation(body.paper_id, title or "New conversation", provider,
+        conv = db.create_conversation(user["id"], body.paper_id, title or "New conversation", provider,
                                       body.model or DEFAULT_MODELS[provider])
 
-    if not PROVIDERS[conv["provider"]].available():
-        raise HTTPException(400, f"Provider {conv['provider']} has no API key configured")
+    if not provider_for(user["keys"], conv["provider"]):
+        raise HTTPException(400, f"Add a {PROVIDERS[conv['provider']].label} key first (Settings → Account),"
+                                 " or pick a provider you have a key for")
 
     async def stream():
         yield _sse({"type": "conversation", "conversation": conv})
         try:
-            async for ev in run_turn(conv, body.question, body.selection.model_dump() if body.selection else None):
+            async for ev in run_turn(user, conv, body.question, body.selection.model_dump() if body.selection else None):
                 yield _sse(ev)
         except asyncio.CancelledError:
             raise

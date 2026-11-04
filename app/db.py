@@ -8,9 +8,11 @@ from contextlib import contextmanager
 
 from .config import DB_PATH, TURSO_AUTH_TOKEN, TURSO_DATABASE_URL
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS papers (
-    id TEXT PRIMARY KEY,
+# Everything a user makes is theirs: their library, folders, chats and spending carry their user_id.
+# Rows from before accounts have user_id '' until the first admin signs in and claims them.
+PAPERS_TABLE = """
+CREATE TABLE IF NOT EXISTS {name} (
+    id TEXT NOT NULL,               -- the arXiv ID ("2210.02747"; with the version once archived), or url-<hash>
     source_url TEXT NOT NULL,
     title TEXT NOT NULL,
     authors TEXT NOT NULL,          -- JSON list
@@ -34,22 +36,52 @@ CREATE TABLE IF NOT EXISTS papers (
     pdf_sha256 TEXT,
     arxiv_version INTEGER,          -- NULL for a non-arXiv paper
     latest_version INTEGER,         -- arXiv's latest version when last checked
-    latest_checked_at REAL
+    latest_checked_at REAL,
+    user_id TEXT NOT NULL DEFAULT '',  -- users.id: each user has their own copy of a paper
+    PRIMARY KEY (user_id, id)
+);"""
+CONVERSATIONS_TABLE = """
+CREATE TABLE IF NOT EXISTS {name} (
+    id TEXT PRIMARY KEY,
+    paper_id TEXT,                  -- NULL for a search session (no paper in context)
+    title TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    user_id TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY (user_id, paper_id) REFERENCES papers(user_id, id) ON UPDATE CASCADE
+);"""
+SCHEMA = PAPERS_TABLE.replace("{name}", "papers") + CONVERSATIONS_TABLE.replace("{name}", "conversations") + """
+CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY,
+    email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    email_verified INTEGER NOT NULL DEFAULT 0,
+    username TEXT UNIQUE COLLATE NOCASE,  -- NULL for an account made with Google
+    password_hash TEXT,             -- NULL: signs in with Google only
+    google_sub TEXT UNIQUE,         -- the Google account's id, once it was used to sign in
+    name TEXT NOT NULL DEFAULT '',
+    api_keys TEXT,                  -- the user's own keys, {provider: key}, encrypted (crypto.py)
+    tour_done INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sessions (
+    token_hash TEXT PRIMARY KEY,    -- SHA-256 of the session cookie's token
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    expires_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS email_tokens (  -- the links in emails: verify an address, reset a password
+    token_hash TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    purpose TEXT NOT NULL,          -- verify | reset
+    expires_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS folders (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     created_at REAL NOT NULL,
-    parent_id TEXT                  -- folders.id, NULL for a top-level folder
-);
-CREATE TABLE IF NOT EXISTS conversations (
-    id TEXT PRIMARY KEY,
-    paper_id TEXT REFERENCES papers(id),  -- NULL for a search session (no paper in context)
-    title TEXT NOT NULL,
-    provider TEXT NOT NULL,
-    model TEXT NOT NULL,
-    created_at REAL NOT NULL,
-    updated_at REAL NOT NULL
+    parent_id TEXT,                 -- folders.id, NULL for a top-level folder
+    user_id TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -72,11 +104,18 @@ CREATE TABLE IF NOT EXISTS usage (  -- one row per model call: chat answers and 
     cached_input INTEGER NOT NULL,
     cache_write INTEGER NOT NULL,
     output INTEGER NOT NULL,        -- reasoning included
-    cost REAL                       -- USD; NULL until the model's price is known
+    cost REAL,                      -- USD; NULL until the model's price is known
+    user_id TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, id);
-CREATE INDEX IF NOT EXISTS idx_conv_paper ON conversations(paper_id, updated_at);
-CREATE INDEX IF NOT EXISTS idx_usage_time ON usage(created_at);
+"""
+# After the migrations in init(), which add the columns to older databases.
+INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_conv_paper ON conversations(user_id, paper_id, updated_at);
+CREATE INDEX IF NOT EXISTS idx_usage_time ON usage(user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_folders_user ON folders(user_id);
+CREATE INDEX IF NOT EXISTS idx_papers_pdf ON papers(pdf_url);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
 """
 
 
@@ -119,6 +158,11 @@ def init():
         conv_cols = {r["name"]: r for r in conn.execute("PRAGMA table_info(conversations)")}
         if conv_cols["paper_id"]["notnull"]:
             _make_conversation_paper_optional(conn)
+        # Databases created before accounts have one library, for everyone.
+        if "user_id" not in {r["name"] for r in conn.execute("PRAGMA table_info(papers)")}:
+            _add_user_ids(conn)
+        for statement in filter(str.strip, INDEXES.split(";")):
+            conn.execute(statement)
 
 
 def _backfill_usage(conn):
@@ -158,10 +202,51 @@ def _make_conversation_paper_optional(conn):
             FROM conversations;
         DROP TABLE conversations;
         ALTER TABLE conversations_new RENAME TO conversations;
-        CREATE INDEX IF NOT EXISTS idx_conv_paper ON conversations(paper_id, updated_at);
         COMMIT;
     """)
     conn.execute("PRAGMA foreign_keys = ON")
+
+
+def _add_user_ids(conn):
+    """Gives every row a user_id ('': not claimed yet, see claim_unowned). Papers are keyed by user
+    and id from now on, and conversations refer to them by both, so those two tables are rebuilt.
+
+    One statement at a time (libsql's executescript stops at an error without raising it), in one
+    transaction, with foreign keys off: dropping the old conversations table with them on would
+    delete every message. The row counts must match before it's committed."""
+    tables = ("papers", "conversations", "messages", "folders", "usage")
+    before = {t: conn.execute(f"SELECT count(*) FROM {t}").fetchone()[0] for t in tables}
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys = OFF")
+    if conn.execute("PRAGMA foreign_keys").fetchone()[0]:
+        raise RuntimeError("Could not turn foreign keys off to add user ids to the database")
+    conn.execute("BEGIN")
+    try:
+        for table, create in (("papers", PAPERS_TABLE), ("conversations", CONVERSATIONS_TABLE)):
+            cols = ", ".join(r["name"] for r in conn.execute(f"PRAGMA table_info({table})"))
+            conn.execute(create.replace("{name}", f"{table}_new"))
+            conn.execute(f"INSERT INTO {table}_new ({cols}) SELECT {cols} FROM {table}")
+            conn.execute(f"DROP TABLE {table}")
+            conn.execute(f"ALTER TABLE {table}_new RENAME TO {table}")
+        conn.execute("DROP INDEX IF EXISTS idx_usage_time")  # INDEXES makes it again, by user
+        for table in ("folders", "usage"):
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN user_id TEXT NOT NULL DEFAULT ''")
+        after = {t: conn.execute(f"SELECT count(*) FROM {t}").fetchone()[0] for t in tables}
+        if after != before:
+            raise RuntimeError(f"Adding user ids would change the row counts from {before} to {after}")
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys = ON")
+
+
+def claim_unowned(user_id: str):
+    """The library from before accounts becomes this user's (the first admin to sign in)."""
+    with connect() as conn:
+        for table in ("papers", "folders", "conversations", "usage"):  # papers' conversations follow them
+            conn.execute(f"UPDATE {table} SET user_id = ? WHERE user_id = ''", (user_id,))
 
 
 def _paper_row(row, with_text=False):
@@ -169,6 +254,7 @@ def _paper_row(row, with_text=False):
         return None
     d = dict(row)
     d["authors"] = json.loads(d["authors"])
+    d.pop("user_id", None)
     if not with_text:
         d.pop("text", None)
     for name in ANALYSES:  # served separately by get_analysis
@@ -176,208 +262,251 @@ def _paper_row(row, with_text=False):
     return d
 
 
-def get_paper(paper_id: str, with_text=False):
+def get_paper(user_id: str, paper_id: str, with_text=False):
     with connect() as conn:
-        row = conn.execute("SELECT * FROM papers WHERE id = ?", (paper_id,)).fetchone()
+        row = conn.execute("SELECT * FROM papers WHERE user_id = ? AND id = ?", (user_id, paper_id)).fetchone()
     return _paper_row(row, with_text)
 
 
-def list_papers():
+def list_papers(user_id: str):
     with connect() as conn:
         rows = conn.execute(
             """SELECT p.*, MAX(COALESCE(c.updated_at, p.created_at), p.created_at) AS last_used
-               FROM papers p LEFT JOIN conversations c ON c.paper_id = p.id
-               GROUP BY p.id ORDER BY last_used DESC"""
+               FROM papers p LEFT JOIN conversations c ON c.user_id = p.user_id AND c.paper_id = p.id
+               WHERE p.user_id = ? GROUP BY p.id ORDER BY last_used DESC""", (user_id,)
         ).fetchall()
     return [_paper_row(r) for r in rows]
 
 
-def insert_paper(paper: dict, conn=None):
+def pinned_copy(pdf_url: str) -> dict | None:
+    """Any user's copy of the paper read from this PDF (an exact arXiv version), with its text and
+    its finished analyses, so another user adding it doesn't download it and analyze it again."""
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM papers WHERE pdf_url = ? AND pdf_sha256 IS NOT NULL"
+                           " ORDER BY (glossary_status IS 'ready') + (refs_status IS 'ready') + (bib_status IS 'ready') DESC"
+                           " LIMIT 1", (pdf_url,)).fetchone()
+    if row is None:
+        return None
+    paper = _paper_row(row, with_text=True)
+    paper["analyses"] = {name: json.loads(row[name]) for name in ANALYSES
+                         if row[f"{name}_status"] == "ready" and row[name]}
+    return paper
+
+
+def pdf_in_use(sha256: str) -> bool:
+    """Whether a paper (any user's) was read from the PDF with this hash: its cached file is shared."""
+    with connect() as conn:
+        return conn.execute("SELECT 1 FROM papers WHERE pdf_sha256 = ? LIMIT 1", (sha256,)).fetchone() is not None
+
+
+def insert_paper(user_id: str, paper: dict, conn=None):
+    """paper["analyses"], if given, are finished analyses ({name: entries}) copied with it."""
     if conn is None:
         with connect() as conn:
-            return insert_paper(paper, conn)
+            return insert_paper(user_id, paper, conn)
+    analyses = paper.get("analyses") or {}
     conn.execute(
         """INSERT OR IGNORE INTO papers
-           (id, source_url, title, authors, abstract, published, num_pages, text, created_at,
-            pdf_url, pdf_sha256, arxiv_version, folder_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           (user_id, id, source_url, title, authors, abstract, published, num_pages, text, created_at,
+            pdf_url, pdf_sha256, arxiv_version, folder_id, glossary, glossary_status, refs, refs_status,
+            bib, bib_status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
-            paper["id"], paper["source_url"], paper["title"], json.dumps(paper["authors"]),
+            user_id, paper["id"], paper["source_url"], paper["title"], json.dumps(paper["authors"]),
             paper.get("abstract", ""), paper.get("published", ""), paper["num_pages"],
             paper["text"], time.time(), paper["pdf_url"], paper["pdf_sha256"],
             paper.get("arxiv_version"), paper.get("folder_id"),
+            *(v for name in ANALYSES for v in ((json.dumps(analyses[name]), "ready") if name in analyses
+                                               else (None, None))),
         ),
     )
 
 
 def set_latest_version(paper_id: str, version: int):
+    """For every user's copy: it's a fact about arXiv."""
     with connect() as conn:
         conn.execute("UPDATE papers SET latest_version = ?, latest_checked_at = ? WHERE id = ?",
                      (version, time.time(), paper_id))
 
 
-def archive_and_replace(paper_id: str, archived_id: str, archive_folder_id: str, new: dict):
+def archive_and_replace(user_id: str, paper_id: str, archived_id: str, archive_folder_id: str, new: dict):
     """In one transaction: the paper becomes archived_id (with its conversations, analyses and
     spending) in the archive folder, and the new paper takes its id and its folder."""
     with connect() as conn:
-        folder_id = conn.execute("SELECT folder_id FROM papers WHERE id = ?", (paper_id,)).fetchone()["folder_id"]
-        cols = [r["name"] for r in conn.execute("PRAGMA table_info(papers)") if r["name"] not in ("id", "folder_id")]
-        conn.execute(f"INSERT INTO papers (id, folder_id, {', '.join(cols)})"
-                     f" SELECT ?, ?, {', '.join(cols)} FROM papers WHERE id = ?",
-                     (archived_id, archive_folder_id, paper_id))
-        conn.execute("UPDATE conversations SET paper_id = ? WHERE paper_id = ?", (archived_id, paper_id))
-        conn.execute("UPDATE usage SET paper_id = ? WHERE paper_id = ?", (archived_id, paper_id))
-        conn.execute("DELETE FROM papers WHERE id = ?", (paper_id,))
-        insert_paper({**new, "id": paper_id, "folder_id": folder_id}, conn)
+        folder_id = conn.execute("SELECT folder_id FROM papers WHERE user_id = ? AND id = ?",
+                                 (user_id, paper_id)).fetchone()["folder_id"]
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(papers)")
+                if r["name"] not in ("id", "folder_id", "user_id")]
+        conn.execute(f"INSERT INTO papers (user_id, id, folder_id, {', '.join(cols)})"
+                     f" SELECT user_id, ?, ?, {', '.join(cols)} FROM papers WHERE user_id = ? AND id = ?",
+                     (archived_id, archive_folder_id, user_id, paper_id))
+        conn.execute("UPDATE conversations SET paper_id = ? WHERE user_id = ? AND paper_id = ?",
+                     (archived_id, user_id, paper_id))
+        conn.execute("UPDATE usage SET paper_id = ? WHERE user_id = ? AND paper_id = ?", (archived_id, user_id, paper_id))
+        conn.execute("DELETE FROM papers WHERE user_id = ? AND id = ?", (user_id, paper_id))
+        insert_paper(user_id, {**new, "id": paper_id, "folder_id": folder_id}, conn)
 
 
-def top_folder(name: str) -> str:
-    """The id of the top-level folder with this name, created if there's none."""
+def top_folder(user_id: str, name: str) -> str:
+    """The id of the user's top-level folder with this name, created if there's none."""
     with connect() as conn:
-        row = conn.execute("SELECT id FROM folders WHERE parent_id IS NULL AND name = ? COLLATE NOCASE",
-                           (name,)).fetchone()
-    return row["id"] if row else create_folder(name)["id"]
+        row = conn.execute("SELECT id FROM folders WHERE user_id = ? AND parent_id IS NULL AND name = ? COLLATE NOCASE",
+                           (user_id, name)).fetchone()
+    return row["id"] if row else create_folder(user_id, name)["id"]
 
 
 ANALYSES = ("glossary", "refs", "bib")  # model-generated per-paper data; also the column names
 
 
-def get_analysis(paper_id: str, name: str) -> dict | None:
+def get_analysis(user_id: str, paper_id: str, name: str) -> dict | None:
     assert name in ANALYSES
     with connect() as conn:
-        row = conn.execute(f"SELECT {name}, {name}_status FROM papers WHERE id = ?", (paper_id,)).fetchone()
+        row = conn.execute(f"SELECT {name}, {name}_status FROM papers WHERE user_id = ? AND id = ?",
+                           (user_id, paper_id)).fetchone()
     if row is None:
         return None
     return {"status": row[f"{name}_status"], "entries": json.loads(row[name]) if row[name] else {}}
 
 
-def set_analysis(paper_id: str, name: str, status: str, entries: dict | None = None):
+def set_analysis(user_id: str, paper_id: str, name: str, status: str, entries: dict | None = None):
     assert name in ANALYSES
     with connect() as conn:
-        conn.execute(f"UPDATE papers SET {name}_status = ?, {name} = COALESCE(?, {name}) WHERE id = ?",
-                     (status, json.dumps(entries) if entries is not None else None, paper_id))
+        conn.execute(f"UPDATE papers SET {name}_status = ?, {name} = COALESCE(?, {name}) WHERE user_id = ? AND id = ?",
+                     (status, json.dumps(entries) if entries is not None else None, user_id, paper_id))
 
 
-def list_folders():
+def list_folders(user_id: str):
     with connect() as conn:
-        return [dict(r) for r in conn.execute("SELECT * FROM folders ORDER BY name COLLATE NOCASE").fetchall()]
+        rows = conn.execute("SELECT * FROM folders WHERE user_id = ? ORDER BY name COLLATE NOCASE", (user_id,))
+        return [{k: r[k] for k in r.keys() if k != "user_id"} for r in rows.fetchall()]
 
 
-def create_folder(name: str, parent_id: str | None = None) -> dict:
+def create_folder(user_id: str, name: str, parent_id: str | None = None) -> dict:
     folder = {"id": uuid.uuid4().hex[:12], "name": name, "created_at": time.time(), "parent_id": parent_id}
     with connect() as conn:
-        conn.execute("INSERT INTO folders (id, name, created_at, parent_id)"
-                     " VALUES (:id, :name, :created_at, :parent_id)", folder)
+        conn.execute("INSERT INTO folders (id, name, created_at, parent_id, user_id)"
+                     " VALUES (:id, :name, :created_at, :parent_id, :user_id)", {**folder, "user_id": user_id})
     return folder
 
 
-def rename_folder(folder_id: str, name: str) -> bool:
+def rename_folder(user_id: str, folder_id: str, name: str) -> bool:
     with connect() as conn:
-        return conn.execute("UPDATE folders SET name = ? WHERE id = ?", (name, folder_id)).rowcount > 0
+        return conn.execute("UPDATE folders SET name = ? WHERE user_id = ? AND id = ?",
+                            (name, user_id, folder_id)).rowcount > 0
 
 
-def set_folder_parent(folder_id: str, parent_id: str | None) -> bool:
+def set_folder_parent(user_id: str, folder_id: str, parent_id: str | None) -> bool:
     with connect() as conn:
-        return conn.execute("UPDATE folders SET parent_id = ? WHERE id = ?", (parent_id, folder_id)).rowcount > 0
+        return conn.execute("UPDATE folders SET parent_id = ? WHERE user_id = ? AND id = ?",
+                            (parent_id, user_id, folder_id)).rowcount > 0
 
 
-def folder_subtree_ids(folder_id: str) -> list[str]:
+def folder_subtree_ids(user_id: str, folder_id: str) -> list[str]:
     """The folder and all the folders nested in it, at any depth."""
     with connect() as conn:
         return [r["id"] for r in conn.execute("""
             WITH RECURSIVE sub(id) AS (
-                SELECT id FROM folders WHERE id = ?
+                SELECT id FROM folders WHERE user_id = ? AND id = ?
                 UNION SELECT f.id FROM folders f JOIN sub ON f.parent_id = sub.id)
-            SELECT id FROM sub""", (folder_id,))]
+            SELECT id FROM sub""", (user_id, folder_id))]
 
 
-def delete_folder(folder_id: str):
+def delete_folder(user_id: str, folder_id: str):
     """Deletes the folder only; its papers and subfolders move up to its parent (or become unfiled)."""
     with connect() as conn:
-        row = conn.execute("SELECT parent_id FROM folders WHERE id = ?", (folder_id,)).fetchone()
-        parent_id = row["parent_id"] if row else None
-        conn.execute("UPDATE papers SET folder_id = ? WHERE folder_id = ?", (parent_id, folder_id))
-        conn.execute("UPDATE folders SET parent_id = ? WHERE parent_id = ?", (parent_id, folder_id))
+        row = conn.execute("SELECT parent_id FROM folders WHERE user_id = ? AND id = ?", (user_id, folder_id)).fetchone()
+        if row is None:
+            return
+        conn.execute("UPDATE papers SET folder_id = ? WHERE user_id = ? AND folder_id = ?",
+                     (row["parent_id"], user_id, folder_id))
+        conn.execute("UPDATE folders SET parent_id = ? WHERE parent_id = ?", (row["parent_id"], folder_id))
         conn.execute("DELETE FROM folders WHERE id = ?", (folder_id,))
 
 
-def delete_folder_tree(folder_id: str):
+def delete_folder_tree(user_id: str, folder_id: str):
     """Deletes the folder and its subfolders; their papers must already be gone."""
-    ids = folder_subtree_ids(folder_id)
+    ids = folder_subtree_ids(user_id, folder_id)
     with connect() as conn:
         conn.executemany("DELETE FROM folders WHERE id = ?", [(i,) for i in ids])
 
 
-def folder_paper_ids(folder_id: str) -> list[str]:
+def folder_paper_ids(user_id: str, folder_id: str) -> list[str]:
     """Papers in the folder or any of its subfolders."""
-    ids = folder_subtree_ids(folder_id)
+    ids = folder_subtree_ids(user_id, folder_id)
     with connect() as conn:
         return [r["id"] for r in conn.execute(
-            f"SELECT id FROM papers WHERE folder_id IN ({','.join('?' * len(ids))})", ids)] if ids else []
+            f"SELECT id FROM papers WHERE user_id = ? AND folder_id IN ({','.join('?' * len(ids))})",
+            (user_id, *ids))] if ids else []
 
 
-def delete_paper(paper_id: str) -> bool:
+def delete_paper(user_id: str, paper_id: str) -> bool:
     """Deletes the paper with its conversations and messages."""
     with connect() as conn:
         conn.execute("DELETE FROM messages WHERE conversation_id IN"
-                     " (SELECT id FROM conversations WHERE paper_id = ?)", (paper_id,))
-        conn.execute("DELETE FROM conversations WHERE paper_id = ?", (paper_id,))
-        return conn.execute("DELETE FROM papers WHERE id = ?", (paper_id,)).rowcount > 0
+                     " (SELECT id FROM conversations WHERE user_id = ? AND paper_id = ?)", (user_id, paper_id))
+        conn.execute("DELETE FROM conversations WHERE user_id = ? AND paper_id = ?", (user_id, paper_id))
+        return conn.execute("DELETE FROM papers WHERE user_id = ? AND id = ?", (user_id, paper_id)).rowcount > 0
 
 
-def set_paper_folder(paper_id: str, folder_id: str | None) -> bool:
+def set_paper_folder(user_id: str, paper_id: str, folder_id: str | None) -> bool:
     with connect() as conn:
-        return conn.execute("UPDATE papers SET folder_id = ? WHERE id = ?", (folder_id, paper_id)).rowcount > 0
+        return conn.execute("UPDATE papers SET folder_id = ? WHERE user_id = ? AND id = ?",
+                            (folder_id, user_id, paper_id)).rowcount > 0
 
 
-def create_conversation(paper_id: str | None, title: str, provider: str, model: str) -> dict:
+def create_conversation(user_id: str, paper_id: str | None, title: str, provider: str, model: str) -> dict:
     now = time.time()
     conv = {
         "id": uuid.uuid4().hex[:12], "paper_id": paper_id, "title": title,
-        "provider": provider, "model": model, "created_at": now, "updated_at": now,
+        "provider": provider, "model": model, "created_at": now, "updated_at": now, "user_id": user_id,
     }
     with connect() as conn:
         conn.execute(
-            "INSERT INTO conversations VALUES (:id, :paper_id, :title, :provider, :model, :created_at, :updated_at)",
+            "INSERT INTO conversations (id, paper_id, title, provider, model, created_at, updated_at, user_id)"
+            " VALUES (:id, :paper_id, :title, :provider, :model, :created_at, :updated_at, :user_id)",
             conv,
         )
     return conv
 
 
-def get_conversation(conv_id: str):
+def get_conversation(user_id: str, conv_id: str):
     with connect() as conn:
-        row = conn.execute("SELECT * FROM conversations WHERE id = ?", (conv_id,)).fetchone()
+        row = conn.execute("SELECT * FROM conversations WHERE user_id = ? AND id = ?", (user_id, conv_id)).fetchone()
     return dict(row) if row else None
 
 
-def list_conversations(paper_id: str | None = None):
-    sql = """SELECT c.*, p.title AS paper_title FROM conversations c
-             LEFT JOIN papers p ON p.id = c.paper_id"""
-    args = ()
+def list_conversations(user_id: str, paper_id: str | None = None):
+    sql = """SELECT c.id, c.paper_id, c.title, c.provider, c.model, c.created_at, c.updated_at,
+                    p.title AS paper_title FROM conversations c
+             LEFT JOIN papers p ON p.user_id = c.user_id AND p.id = c.paper_id WHERE c.user_id = ?"""
+    args = (user_id,)
     if paper_id:
-        sql += " WHERE c.paper_id = ?"
-        args = (paper_id,)
+        sql += " AND c.paper_id = ?"
+        args += (paper_id,)
     sql += " ORDER BY c.updated_at DESC"
     with connect() as conn:
         return [dict(r) for r in conn.execute(sql, args).fetchall()]
 
 
-def update_conversation(conv_id: str, **fields):
+def update_conversation(user_id: str, conv_id: str, **fields):
     allowed = {k: v for k, v in fields.items() if k in ("title", "provider", "model") and v}
     allowed["updated_at"] = time.time()
     sets = ", ".join(f"{k} = ?" for k in allowed)
     with connect() as conn:
-        conn.execute(f"UPDATE conversations SET {sets} WHERE id = ?", (*allowed.values(), conv_id))
+        conn.execute(f"UPDATE conversations SET {sets} WHERE user_id = ? AND id = ?",
+                     (*allowed.values(), user_id, conv_id))
 
 
-def delete_conversation(conv_id: str):
+def delete_conversation(user_id: str, conv_id: str):
     with connect() as conn:
-        conn.execute("DELETE FROM messages WHERE conversation_id = ?", (conv_id,))
-        conn.execute("DELETE FROM conversations WHERE id = ?", (conv_id,))
+        conn.execute("DELETE FROM messages WHERE conversation_id IN"
+                     " (SELECT id FROM conversations WHERE user_id = ? AND id = ?)", (user_id, conv_id))
+        conn.execute("DELETE FROM conversations WHERE user_id = ? AND id = ?", (user_id, conv_id))
 
 
 def add_messages(conv_id: str, messages: list[dict]):
-    """Append messages atomically (an assistant turn and its tool results go in together)."""
+    """Append messages atomically (an assistant turn and its tool results go in together). The
+    conversation's owner is checked by whoever got conv_id (get_conversation)."""
     now = time.time()
     with connect() as conn:
         for m in messages:
@@ -412,17 +541,22 @@ def add_usage(row: dict):
     with connect() as conn:
         conn.execute(
             """INSERT INTO usage (created_at, provider, model, kind, paper_id, conversation_id,
-                                  input, cached_input, cache_write, output, cost)
+                                  input, cached_input, cache_write, output, cost, user_id)
                VALUES (:created_at, :provider, :model, :kind, :paper_id, :conversation_id,
-                       :input, :cached_input, :cache_write, :output, :cost)""",
+                       :input, :cached_input, :cache_write, :output, :cost, :user_id)""",
             row,
         )
 
 
-def list_usage(since: float = 0, unpriced_only: bool = False) -> list[dict]:
+def list_usage(user_id: str | None, since: float = 0, unpriced_only: bool = False) -> list[dict]:
+    """The user's model calls (None: everyone's)."""
     sql = "SELECT * FROM usage WHERE created_at >= ?" + (" AND cost IS NULL" if unpriced_only else "")
+    args = (since,)
+    if user_id is not None:
+        sql += " AND user_id = ?"
+        args += (user_id,)
     with connect() as conn:
-        return [dict(r) for r in conn.execute(sql + " ORDER BY created_at", (since,))]
+        return [dict(r) for r in conn.execute(sql + " ORDER BY created_at", args)]
 
 
 def set_usage_costs(costs: dict[int, float]):
@@ -430,6 +564,91 @@ def set_usage_costs(costs: dict[int, float]):
         conn.executemany("UPDATE usage SET cost = ? WHERE id = ?", [(c, i) for i, c in costs.items()])
 
 
-def usage_total() -> float:
+def usage_total(user_id: str) -> float:
     with connect() as conn:
-        return conn.execute("SELECT COALESCE(SUM(cost), 0) FROM usage").fetchone()[0]
+        return conn.execute("SELECT COALESCE(SUM(cost), 0) FROM usage WHERE user_id = ?", (user_id,)).fetchone()[0]
+
+
+# ---------------------------------------------------------------- accounts
+
+USER_FIELDS = ("email", "email_verified", "username", "password_hash", "google_sub", "name", "api_keys", "tour_done")
+
+
+def create_user(**fields) -> dict:
+    user = {"id": uuid.uuid4().hex[:16], "created_at": time.time(), **{k: fields.get(k) for k in USER_FIELDS}}
+    user["email_verified"] = int(bool(user["email_verified"]))
+    user["name"] = user["name"] or ""
+    user["tour_done"] = 0
+    with connect() as conn:
+        conn.execute(f"INSERT INTO users (id, created_at, {', '.join(USER_FIELDS)})"
+                     f" VALUES (:id, :created_at, {', '.join(':' + k for k in USER_FIELDS)})", user)
+    return user
+
+
+def get_user(user_id: str) -> dict | None:
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def find_user(*, email: str | None = None, username: str | None = None, google_sub: str | None = None) -> dict | None:
+    """The user with this email, username or Google account (emails and usernames ignore case)."""
+    column, value = next((c, v) for c, v in (("email", email), ("username", username), ("google_sub", google_sub)) if v)
+    with connect() as conn:
+        row = conn.execute(f"SELECT * FROM users WHERE {column} = ?", (value,)).fetchone()
+    return dict(row) if row else None
+
+
+def update_user(user_id: str, **fields):
+    fields = {k: v for k, v in fields.items() if k in USER_FIELDS}
+    with connect() as conn:
+        conn.execute(f"UPDATE users SET {', '.join(f'{k} = ?' for k in fields)} WHERE id = ?",
+                     (*fields.values(), user_id))
+
+
+def delete_user(user_id: str):
+    with connect() as conn:
+        conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM email_tokens WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+
+
+def add_session(token_hash: str, user_id: str, expires_at: float):
+    with connect() as conn:
+        conn.execute("DELETE FROM sessions WHERE expires_at < ?", (time.time(),))
+        conn.execute("INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)",
+                     (token_hash, user_id, expires_at))
+
+
+def session_user(token_hash: str) -> dict | None:
+    with connect() as conn:
+        row = conn.execute("SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id"
+                           " WHERE s.token_hash = ? AND s.expires_at > ?", (token_hash, time.time())).fetchone()
+    return dict(row) if row else None
+
+
+def delete_sessions(*, token_hash: str | None = None, user_id: str | None = None):
+    """Signs out one session, or every session of a user."""
+    with connect() as conn:
+        if token_hash:
+            conn.execute("DELETE FROM sessions WHERE token_hash = ?", (token_hash,))
+        if user_id:
+            conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+
+
+def add_email_token(token_hash: str, user_id: str, purpose: str, expires_at: float):
+    """A new link replaces any earlier one sent to the user for the same purpose."""
+    with connect() as conn:
+        conn.execute("DELETE FROM email_tokens WHERE (user_id = ? AND purpose = ?) OR expires_at < ?",
+                     (user_id, purpose, time.time()))
+        conn.execute("INSERT INTO email_tokens (token_hash, user_id, purpose, expires_at) VALUES (?, ?, ?, ?)",
+                     (token_hash, user_id, purpose, expires_at))
+
+
+def take_email_token(token_hash: str, purpose: str) -> str | None:
+    """The user id of an unexpired link, which can't be used again."""
+    with connect() as conn:
+        row = conn.execute("SELECT user_id FROM email_tokens WHERE token_hash = ? AND purpose = ? AND expires_at > ?",
+                           (token_hash, purpose, time.time())).fetchone()
+        conn.execute("DELETE FROM email_tokens WHERE token_hash = ?", (token_hash,))
+    return row["user_id"] if row else None

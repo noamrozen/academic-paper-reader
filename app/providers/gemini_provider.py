@@ -3,7 +3,6 @@ import uuid
 from google import genai
 from google.genai import types
 
-from ..config import GEMINI_API_KEY
 from .base import Provider, StepResult, TextDelta, ThinkingDelta, raw_for
 
 _LOCAL_ID = "local_"  # prefix for call ids we generate when Gemini returns none
@@ -16,11 +15,8 @@ class GeminiProvider(Provider):
     id = "gemini"
     label = "Gemini"
 
-    def __init__(self):
-        self._client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
-
-    def available(self):
-        return self._client is not None
+    def __init__(self, api_key: str):
+        self._client = genai.Client(api_key=api_key)
 
     async def list_models(self):
         out = []

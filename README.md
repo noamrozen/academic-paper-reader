@@ -2,6 +2,12 @@
 
 Read arXiv papers next to an LLM research assistant. Paste a link, highlight a passage, and ask about it.
 
+- **Accounts:** sign up with a username, email and password (the email is confirmed by a link), or
+  with Google. Each user has their own library, folders, chats and Usage, and brings their own API
+  keys (Settings → **API keys…**), stored encrypted. Admins (`ADMIN_EMAILS`) use the server's keys
+  from `.env` instead. A first sign-in starts a short **walkthrough** of the app (Settings →
+  **Walkthrough** shows it again). See [Accounts](#accounts) for setting this up.
+
 - Paste an arXiv link or ID (`https://arxiv.org/abs/1706.03762`, `arxiv.org/pdf/1706.03762v7`, `1706.03762`, or any direct PDF URL) and press Enter. The paper is downloaded, its text is extracted, and the PDF is rendered with selectable text.
 - Or type a paper's **name** and press Enter to search arXiv and [OpenAlex](https://openalex.org)
   (no key needed). Pick a result with the mouse or ↑/↓ and Enter to open it. A result opens from arXiv
@@ -83,7 +89,9 @@ uv sync
 uv run uvicorn app.main:app --port 8000
 ```
 
-Then open http://localhost:8000.
+Then open http://localhost:8000 and create an account. To be an admin (using the keys in `.env`,
+and getting the library from before accounts), put your email in `ADMIN_EMAILS` first. Without an
+email service configured, the confirmation link is printed in the terminal.
 
 Web search uses DuckDuckGo by default, with no key. Set `TAVILY_API_KEY` for better results.
 
@@ -92,16 +100,64 @@ Web search uses DuckDuckGo by default, with no key. Set `TAVILY_API_KEY` for bet
 Vercel runs the app as a function whose files are read-only except `/tmp`, which is wiped now and
 then, so the database lives on [Turso](https://turso.tech) (hosted SQLite):
 
-1. In the Vercel project, **Storage → Create Database → Turso Cloud**, connected to the project
-   for all environments. It adds `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` to the project.
-2. Put the same two variables in `.env` (a local run then uses that database too).
+1. In the Vercel project, **Storage → Create Database → Turso Cloud**, connected to the project.
+   It adds `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` to the project.
+2. Put the same two variables in `.env`, for the next step.
 3. Copy the local library into it: `uv run python scripts/migrate_to_turso.py`.
 4. Add the provider keys (`OPENROUTER_API_KEY`, ...) to the project's environment variables, and
-   redeploy.
+   the account settings below (`SECRET_KEY`, `ADMIN_EMAILS`, Google), and redeploy.
+
+Only production deployments use the Turso database (`VERCEL_ENV=production`). Local runs, `vercel
+dev` and preview deployments use a SQLite file instead (`data/app.db`; on a preview, in `/tmp`, so it
+doesn't last), even when they have the Turso settings, so they can't change the production data
+(for instance by migrating it to a newer schema before that version is deployed). `USE_TURSO=1`
+makes one use Turso anyway: give previews a database of their own that way, scoping its variables
+and `USE_TURSO=1` to the Preview environment in Vercel.
 
 On Vercel, `/tmp` only caches PDFs and figure crops, downloaded again (and checked against their
 SHA-256) when missing; arXiv PDFs go to the browser straight from arXiv, since a Vercel response is
 capped at 4.5 MB.
+
+## Accounts
+
+Everyone signs in. Settings for the deployment (Vercel → Project → Settings → Environment Variables,
+or `.env` locally):
+
+- `SECRET_KEY` (required on Vercel): encrypts the API keys users save, so changing it loses them.
+  Make one with `python3 -c 'import secrets; print(secrets.token_urlsafe(32))'`. A local run makes
+  one in `data/secret_key`.
+- `ADMIN_EMAILS`: comma-separated. A user whose confirmed email is listed is an admin: their
+  requests use the server's provider keys (`OPENROUTER_API_KEY`, ...). Everyone else adds their own
+  keys under Settings → API keys…, which are checked with the provider before they're saved.
+- The library from before accounts (papers, folders, chats, spending) has no owner until the first
+  admin signs in, and then becomes theirs.
+
+**Sign in with Google** needs an OAuth client from Google Cloud:
+
+1. In [Google Cloud Console](https://console.cloud.google.com), pick or create a project, and open
+   **Google Auth Platform** (APIs & Services → OAuth consent screen).
+2. **Branding**: an app name and support email. **Audience**: *External*, then **Publish app**
+   (while it's in *Testing*, only the test users listed there can sign in). The app asks only for
+   `openid`, `email` and `profile`, which need no review by Google.
+3. **Clients → Create client → Web application**, with these **Authorized redirect URIs**:
+   `https://<your-app>.vercel.app/auth/google/callback` (your production domain) and
+   `http://localhost:8000/auth/google/callback` for local runs.
+4. Put its client ID and secret in `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`, and redeploy.
+   **Continue with Google** appears on the sign-in page.
+
+Google only redirects to the URIs listed in step 3, so on a preview deployment's own URL use a
+password account (or add that URI). Set `PUBLIC_URL` if the app is behind a proxy that hides its
+address.
+
+**Email** (confirming an address, resetting a password) goes through [Resend](https://resend.com)
+with `RESEND_API_KEY`, or any SMTP server with `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`,
+`SMTP_PASSWORD`. `EMAIL_FROM` is the sender; Resend's default `onboarding@resend.dev` only delivers
+to the Resend account's own address, so verify a domain there before others sign up. Without either,
+links are only written to the server log (Vercel → Logs).
+
+Upgrading a database from before accounts adds a `user_id` to its rows the first time the new
+version starts (`db._add_user_ids`, in one transaction that checks the row counts). Back up a Turso
+database first, e.g. `turso db shell <database> .dump > backup.sql`.
 
 ## Prefix caching design
 
@@ -142,12 +198,16 @@ app/
   usage.py          spending: records each model call's tokens and cost, sums them per day/week/month
   tools.py          web_search, fetch_url, search_arxiv, read_arxiv_paper (provider-neutral schemas)
   prompts.py        system prompt and the paper / question message formats
-  db.py             SQLite: papers, folders, conversations, messages, usage
-  turso.py          Turso (hosted SQLite) behind the sqlite3 interface db.py uses, when TURSO_DATABASE_URL is set
+  db.py             SQLite: users and sessions; papers, folders, conversations, messages and usage, per user
+  auth.py           sign-up, sign-in (password or Google), email links, sessions, users' API keys
+  crypto.py         password hashing (scrypt), tokens, encryption of users' API keys
+  mailer.py         account emails through Resend or SMTP (or the log)
+  turso.py          Turso (hosted SQLite) behind the sqlite3 interface db.py uses, in production (USE_TURSO)
   providers/        anthropic (Messages API, adaptive thinking), openai (Responses API, stateless),
                     gemini (google-genai), openrouter (Chat Completions),
                     all behind one stream_step() interface
-static/             single-page UI (vanilla JS, pdf.js, marked, KaTeX; no build step)
+static/             single-page UI (vanilla JS, pdf.js, marked, KaTeX; no build step); account.js is
+                    the sign-in page and API keys panel, tour.js the walkthrough
 data/               downloaded PDFs + app.db (gitignored)
 ```
 

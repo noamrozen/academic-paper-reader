@@ -3,7 +3,6 @@ import re
 
 import openai
 
-from ..config import OPENAI_API_KEY
 from .base import Provider, StepResult, TextDelta, ThinkingDelta, raw_for
 
 _REASONING = re.compile(r"^(o\d|gpt-5)")
@@ -17,11 +16,8 @@ class OpenAIProvider(Provider):
     id = "openai"
     label = "OpenAI"
 
-    def __init__(self):
-        self._client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-
-    def available(self):
-        return self._client is not None
+    def __init__(self, api_key: str):
+        self._client = openai.AsyncOpenAI(api_key=api_key)
 
     async def list_models(self):
         ids = [m.id async for m in self._client.models.list()]

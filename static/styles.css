@@ -492,7 +492,8 @@ button.analysis-pill { border: 0; cursor: pointer; font: inherit; font-size: cal
 }
 #app.chat-collapsed .chat-expand:hover { color: var(--accent); background: var(--accent-soft); }
 .chat-expand-label { writing-mode: vertical-rl; font-size: calc(12px * var(--ui-scale)); font-weight: 600; letter-spacing: 0.06em; }
-#new-chat, #send, #stop, .ask-actions button, .confirm-actions button {
+#new-chat, #send, #stop, .ask-actions button, .confirm-actions button, .auth-submit, .key-input button,
+.key-callout button, .tour-actions button, .tour-inline {
   border: 1px solid var(--accent); background: var(--accent); color: white;
   border-radius: 6px; padding: 4px 10px; cursor: pointer; white-space: nowrap;
 }
@@ -795,6 +796,116 @@ a.cite-title:hover { text-decoration: underline; }
 
   .modal-backdrop { padding: 8px; }
   .modal { max-height: 100%; }
+  .tour-card, .tour.centered .tour-card { left: 8px !important; right: 8px; top: auto !important; bottom: 8px; transform: none; width: auto; }
+  .auth { align-items: flex-start; padding: 24px 12px; }
   /* iOS zooms into any field whose text is smaller than 16px. */
-  input, select, textarea, .setting :is(select, input), #notation-filter, .modal-filter { font-size: max(16px, 1em); }
+  input, select, textarea, .setting :is(select, input), #notation-filter, .modal-filter, .auth-field input,
+  .key-input input { font-size: max(16px, 1em); }
 }
+
+/* Accounts: the sign-in page covers the app until someone is signed in (account.js). */
+body.signed-out #app { visibility: hidden; }
+.auth {
+  position: fixed; inset: 0; z-index: 80; overflow: auto; background: var(--bg);
+  display: flex; align-items: center; justify-content: center; padding: 24px 16px;
+}
+.auth-card {
+  width: min(380px, 100%); display: flex; flex-direction: column; gap: 12px; padding: 24px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 14px; box-shadow: 0 8px 30px rgba(0, 0, 0, 0.08);
+}
+.auth-card h2 { margin: 4px 0 0; font-size: calc(16px * var(--ui-scale)); }
+.auth-card p { margin: 0; line-height: 1.45; }
+.auth-brand { display: flex; align-items: center; gap: 12px; margin-bottom: 4px; }
+.auth-brand h1 { margin: 0; font-size: calc(19px * var(--ui-scale)); }
+.auth-brand p { font-size: calc(12.5px * var(--ui-scale)); }
+.google-btn {
+  display: flex; align-items: center; justify-content: center; gap: 10px; padding: 9px 12px;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--panel); color: var(--text);
+  text-decoration: none; font-weight: 500;
+}
+.google-btn:hover { border-color: var(--muted); background: var(--bg); }
+.auth-or { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: calc(12px * var(--ui-scale)); }
+.auth-or::before, .auth-or::after { content: ""; flex: 1; border-top: 1px solid var(--border); }
+.auth-tabs { display: flex; border-bottom: 1px solid var(--border); }
+.auth-tabs button {
+  flex: 1; padding: 8px; border: 0; border-bottom: 2px solid transparent; margin-bottom: -1px;
+  background: none; color: var(--muted); cursor: pointer; font-weight: 500;
+}
+.auth-tabs button[aria-selected="true"] { color: var(--text); border-bottom-color: var(--accent); }
+.auth-form { display: flex; flex-direction: column; gap: 10px; }
+.auth-field { display: flex; flex-direction: column; gap: 4px; font-size: calc(12.5px * var(--ui-scale)); color: var(--muted); }
+.auth-field input, .key-input input {
+  padding: 8px 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--bg);
+  color: var(--text); outline: none; min-width: 0;
+}
+.auth-field input:focus, .key-input input:focus { border-color: var(--accent); }
+.auth-submit { padding: 8px 12px !important; margin-top: 2px; }
+.auth-msg { padding: 8px 10px; border-radius: 7px; background: var(--accent-soft); font-size: calc(13px * var(--ui-scale)); }
+.auth-msg.error { color: var(--status-critical); background: color-mix(in srgb, var(--status-critical) 10%, transparent); }
+.auth-link {
+  align-self: flex-start; padding: 0; border: 0; background: none; color: var(--accent); cursor: pointer;
+  font-size: calc(13px * var(--ui-scale));
+}
+.auth-link:hover { text-decoration: underline; }
+.auth-row { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.auth-note { font-size: calc(12px * var(--ui-scale)); }
+
+/* Account, in the Settings popover */
+.account-summary { font-size: calc(12.5px * var(--ui-scale)); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.account-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.account-actions button {
+  padding: 3px 9px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg);
+  cursor: pointer; font-size: calc(12px * var(--ui-scale));
+}
+.account-actions button:hover { border-color: var(--accent); color: var(--accent); }
+.settings-pop-sep { border-top: 1px solid var(--border); padding-top: 8px; margin-top: 2px; }
+
+/* Account panel: the user's API keys */
+.account-modal { width: min(560px, 100%); }
+.modal-head-fill { flex: 1; }
+.account-body { padding: 4px 16px 18px; overflow: auto; }
+.account-body h3 { margin: 16px 0 4px; font-size: calc(14px * var(--ui-scale)); }
+.account-who { padding: 12px 0 4px; display: flex; flex-direction: column; gap: 2px; }
+.account-intro { margin: 0 0 6px; font-size: calc(12.5px * var(--ui-scale)); line-height: 1.45; }
+.badge {
+  display: inline-block; margin-left: 6px; padding: 1px 7px; border-radius: 999px; vertical-align: 1px;
+  background: var(--accent-soft); color: var(--accent); font-size: calc(11px * var(--ui-scale)); font-weight: 600;
+}
+.badge.good { background: color-mix(in srgb, var(--status-good) 14%, transparent); color: var(--status-good); }
+.key-row { padding: 10px 0; border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: 6px; }
+.key-head { display: flex; align-items: baseline; gap: 2px; }
+.key-label { font-weight: 600; }
+.key-get { margin-left: auto; font-size: calc(12px * var(--ui-scale)); color: var(--accent); text-decoration: none; }
+.key-get:hover { text-decoration: underline; }
+.key-note { margin: 0; font-size: calc(12px * var(--ui-scale)); line-height: 1.4; }
+.key-input { display: flex; gap: 6px; }
+.key-input input { flex: 1; padding: 5px 9px; }
+.key-input button.secondary { border-color: var(--border) !important; }
+.key-msg { margin: 0; color: var(--status-critical); font-size: calc(12px * var(--ui-scale)); }
+
+/* "Add an API key" above the chat box, until the user has one */
+.key-callout {
+  display: flex; align-items: center; gap: 12px; margin: 0 12px 8px; padding: 10px 12px;
+  border: 1px solid var(--accent); border-radius: 10px; background: var(--accent-soft);
+}
+.key-callout p { margin: 0; font-size: calc(12.5px * var(--ui-scale)); line-height: 1.4; }
+.key-callout button { flex: none; }
+
+/* Walkthrough (tour.js): the target shows through a hole in the dimmed page. */
+.tour { position: fixed; inset: 0; z-index: 70; }
+.tour-spot {
+  position: fixed; border-radius: 10px; box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.5), 0 0 0 2px var(--accent);
+  transition: all 0.25s ease; pointer-events: none;
+}
+.tour.centered .tour-spot { left: 50% !important; top: 50% !important; width: 0 !important; height: 0 !important; box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.5); }
+.tour-card {
+  position: fixed; width: min(340px, calc(100vw - 16px)); padding: 12px 14px 14px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
+}
+.tour.centered .tour-card { left: 50% !important; top: 50% !important; transform: translate(-50%, -50%); width: min(400px, calc(100vw - 16px)); }
+.tour-top { display: flex; align-items: center; justify-content: space-between; }
+.tour-count { font-size: calc(11.5px * var(--ui-scale)); }
+.tour-card h3 { margin: 4px 0 6px; font-size: calc(15px * var(--ui-scale)); }
+.tour-body p { margin: 0 0 8px; line-height: 1.5; font-size: calc(13px * var(--ui-scale)); }
+.tour-inline { margin: 2px 0 8px; }
+.tour-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }

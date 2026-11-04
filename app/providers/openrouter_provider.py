@@ -2,7 +2,7 @@ import json
 
 import openai
 
-from ..config import OPENROUTER_API_KEY, OPENROUTER_MAX_TOKENS
+from ..config import OPENROUTER_MAX_TOKENS
 from .base import Provider, StepResult, TextDelta, ThinkingDelta, raw_for, tool_result_text
 
 BASE_URL = "https://openrouter.ai/api/v1"
@@ -18,14 +18,14 @@ class OpenRouterProvider(Provider):
     id = "openrouter"
     label = "OpenRouter"
 
-    def __init__(self):
+    def __init__(self, api_key: str):
         self._client = openai.AsyncOpenAI(
-            base_url=BASE_URL, api_key=OPENROUTER_API_KEY,
-            default_headers={"X-Title": "Academic Paper Reader"},
-        ) if OPENROUTER_API_KEY else None
+            base_url=BASE_URL, api_key=api_key, default_headers={"X-Title": "Academic Paper Reader"},
+        )
 
-    def available(self):
-        return self._client is not None
+    async def check_key(self):
+        # The model list is public, so it would accept any key; this endpoint describes the key.
+        await self._client.get("/key", cast_to=object)
 
     async def list_models(self):
         models = [m async for m in self._client.models.list()]

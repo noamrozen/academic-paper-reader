@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import httpx
 
 from . import db
-from .config import BUDGETS, HTTP_HEADERS, OPENROUTER_API_KEY
+from .config import BUDGETS, HTTP_HEADERS
 
 log = logging.getLogger(__name__)
 
@@ -30,7 +30,7 @@ HISTORY = {"day": 14, "week": 12, "month": 12}
 
 _catalog: dict[str, dict] = {}  # model id, exact or normalized (see _norm) -> pricing
 _catalog_at = 0.0
-_key_budgets: tuple[float, list] = (0.0, [])
+_key_budgets: dict[str, tuple[float, list]] = {}  # OpenRouter key -> (when read, its budgets)
 
 
 def _norm(model_id: str) -> str:
@@ -99,7 +99,7 @@ async def price(provider: str, model: str, u: dict) -> float | None:
     return _cost(pricing, u) if pricing else None
 
 
-async def record(provider: str, model: str, u: dict, *, kind: str, paper_id: str | None = None,
+async def record(user_id: str, provider: str, model: str, u: dict, *, kind: str, paper_id: str | None = None,
                  conversation_id: str | None = None):
     """Never raises: a failure here must not break the answer or analysis being recorded."""
     try:
@@ -110,14 +110,14 @@ async def record(provider: str, model: str, u: dict, *, kind: str, paper_id: str
             "created_at": time.time(), "provider": provider, "model": model, "kind": kind,
             "paper_id": paper_id, "conversation_id": conversation_id, "input": u.get("input", 0),
             "cached_input": u.get("cached_input", 0), "cache_write": u.get("cache_write", 0),
-            "output": u.get("output", 0), "cost": cost,
+            "output": u.get("output", 0), "cost": cost, "user_id": user_id,
         })
     except Exception:
         log.exception("Could not record usage for %s %s", provider, model)
 
 
 async def _price_missing():
-    rows = db.list_usage(unpriced_only=True)
+    rows = db.list_usage(None, unpriced_only=True)
     if not rows:
         return
     costs = {}
@@ -142,21 +142,21 @@ def _previous(start: date, period: str) -> date:
     return start - timedelta(days=7 if period == "week" else 1)
 
 
-async def _openrouter_budgets() -> list[dict]:
+async def _openrouter_budgets(key: str | None) -> list[dict]:
     """The OpenRouter key's credit limits: spending there counts every app using the key."""
-    global _key_budgets
-    if not OPENROUTER_API_KEY:
+    if not key:
         return []
-    if time.time() - _key_budgets[0] < KEY_TTL:
-        return _key_budgets[1]
+    read_at, cached = _key_budgets.get(key, (0.0, []))
+    if time.time() - read_at < KEY_TTL:
+        return cached
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(KEY_URL, headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"})
+            r = await client.get(KEY_URL, headers={"Authorization": f"Bearer {key}"})
             r.raise_for_status()
         data = r.json()["data"]
     except Exception as e:
         log.warning("Could not read the OpenRouter key's limits: %s", e)
-        return _key_budgets[1]
+        return cached
     budgets = [
         {"source": "OpenRouter key", "limit": b["limit_usd"], "spent": b["spend_usd"],
          "reset": b.get("reset_interval"), "resets_at": b.get("resets_at")}
@@ -165,13 +165,14 @@ async def _openrouter_budgets() -> list[dict]:
     if not budgets and data.get("limit") is not None:  # keys from before per-interval budgets
         budgets = [{"source": "OpenRouter key", "limit": data["limit"], "spent": data.get("usage") or 0,
                     "reset": data.get("limit_reset"), "resets_at": None}]
-    _key_budgets = (time.time(), budgets)
+    _key_budgets[key] = (time.time(), budgets)
     return budgets
 
 
-async def summary(tz_name: str | None) -> dict:
-    """Spending per day, week and month in the viewer's time zone: the current period, recent
-    periods for a chart, and the current period by model, with any budgets."""
+async def summary(user: dict, tz_name: str | None) -> dict:
+    """The user's spending per day, week and month in their time zone: the current period, recent
+    periods for a chart, and the current period by model, with any budgets (BUDGETS are the
+    server keys' budgets, so only admins see them)."""
     try:
         tz = ZoneInfo(tz_name) if tz_name else None
     except (ZoneInfoNotFoundError, ValueError):
@@ -185,10 +186,11 @@ async def summary(tz_name: str | None) -> dict:
             s.append(_previous(s[-1], period))
         starts[period] = s
     since = min(s[-1] for s in starts.values())
-    rows = db.list_usage(since=datetime.combine(since, datetime.min.time(), tz).timestamp())
+    rows = db.list_usage(user["id"], since=datetime.combine(since, datetime.min.time(), tz).timestamp())
+    budgets = BUDGETS if user["is_admin"] else {}
 
-    out = {"currency": "USD", "total": db.usage_total(), "periods": {},
-           "provider_budgets": await _openrouter_budgets()}
+    out = {"currency": "USD", "total": db.usage_total(user["id"]), "periods": {},
+           "provider_budgets": await _openrouter_budgets(user["keys"].get("openrouter"))}
     for period, period_starts in starts.items():
         current = period_starts[0]
         history = {s: 0.0 for s in period_starts}
@@ -214,6 +216,6 @@ async def summary(tz_name: str | None) -> dict:
             "start": current.isoformat(), "cost": history[current], "calls": calls, "unpriced": unpriced,
             "history": [{"start": s.isoformat(), "cost": history[s]} for s in reversed(period_starts)],
             "models": sorted(models.values(), key=lambda m: -m["cost"]),
-            "budget": BUDGETS.get(period),
+            "budget": budgets.get(period),
         }
     return out

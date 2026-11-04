@@ -38,14 +38,20 @@ class StepResult:
 
 
 class Provider:
+    """One instance per API key (see get_provider)."""
+
     id: str
     label: str
 
-    def available(self) -> bool:
+    def __init__(self, api_key: str):
         raise NotImplementedError
 
     async def list_models(self) -> list[str]:
         raise NotImplementedError
+
+    async def check_key(self):
+        """Raises if the provider rejects this instance's key."""
+        await self.list_models()
 
     def stream_step(
         self, *, model: str, system: str, paper_text: str, paper_id: str | None,

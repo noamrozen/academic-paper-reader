@@ -2,6 +2,8 @@ import * as pdfjsLib from "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build
 import { marked } from "https://cdn.jsdelivr.net/npm/marked@15.0.12/lib/marked.esm.js";
 import DOMPurify from "https://cdn.jsdelivr.net/npm/dompurify@3.2.6/dist/purify.es.mjs";
 import katex from "https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.mjs";
+import { openAccount, signIn, signOut } from "/static/account.js";
+import { startTour } from "/static/tour.js";
 
 // Browsers refuse cross-origin module workers, so start the CDN worker from a same-origin blob.
 const PDF_WORKER = "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.worker.min.mjs";
@@ -40,6 +42,7 @@ const store = {
 };
 
 const state = {
+  user: null,           // the signed-in user (/api/auth/me): {email, username, is_admin, keys, tour_done, ...}
   providers: [],
   paper: null,          // current paper metadata
   pdf: null,            // pdfjs document
@@ -63,6 +66,7 @@ async function api(path, opts = {}) {
     ...opts,
     body: opts.body ? JSON.stringify(opts.body) : undefined,
   });
+  if (res.status === 401) location.reload(); // signed out (e.g. elsewhere): back to the sign-in page
   if (!res.ok) throw new Error(await errorMessage(res));
   return res.json();
 }
@@ -1414,6 +1418,7 @@ function setPendingSelection(sel) {
 async function loadConfig() {
   const cfg = await api("/api/config");
   state.providers = cfg.providers;
+  showUser(cfg.user);
   const select = $("provider");
   select.replaceChildren(...cfg.providers.map((p) =>
     el("option", { value: p.id, disabled: !p.available },
@@ -1422,7 +1427,30 @@ async function loadConfig() {
   const chosen = cfg.providers.find((p) => p.id === cfg.default_provider);
   if (chosen) setProvider(chosen.id, chosen.default_model);
   if (cfg.voice) addVoice(cfg.voice);
+  for (const mic of document.querySelectorAll("button.mic")) mic.hidden = !cfg.voice; // its key was removed
 }
+
+// ---------------------------------------------------------------- Account
+
+function showUser(user) {
+  state.user = user;
+  const who = user.name || user.username || user.email;
+  $("account-summary").textContent = user.is_admin ? `${who} · admin` : who;
+  $("account-summary").title = user.email;
+  // Without a key for any model provider there's nothing to ask (Tavily alone isn't one).
+  const hasModel = Object.keys(user.keys).some((k) => k !== "tavily");
+  $("key-callout").hidden = hasModel;
+}
+
+// Saving or removing a key changes the providers on offer (and whether voice works).
+function showAccount(onClose) {
+  toggleSettings(false);
+  openAccount(state.user, { onChange: (user) => { showUser(user); loadConfig().catch(() => {}); }, onClose });
+}
+$("account-btn").onclick = () => showAccount();
+$("key-callout-btn").onclick = () => showAccount();
+$("signout-btn").onclick = () => signOut();
+$("tour-btn").onclick = () => { toggleSettings(false); walkthrough(); };
 
 async function setProvider(providerId, model) {
   $("provider").value = providerId;
@@ -2558,6 +2586,7 @@ function micButton(input) {
 
 function addVoice(voice) {
   if (!navigator.mediaDevices?.getUserMedia || !window.AudioWorkletNode) return;  // needs https (or localhost)
+  if (popoverMic) return;  // added already (the config is loaded again when a key is added)
   voiceEndSilence = voice.end_silence;
   $("send").before(micButton($("question")));
   $("ask-new").parentNode.prepend(popoverMic = micButton($("ask-input")));
@@ -2774,9 +2803,72 @@ const fitPlaceholder = () => {
 phone.addEventListener("change", fitPlaceholder);
 fitPlaceholder();
 
+// ---------------------------------------------------------------- Walkthrough
+
+// The first time someone signs in, and again from Settings → Walkthrough. Steps point at what's on
+// screen; on a phone, the sidebar's steps open its drawer first.
+function walkthrough() {
+  const visible = (...nodes) => nodes.find((n) => n && n.getBoundingClientRect().width > 0) || null;
+  const sidebar = (open) => () => { if (phone.matches) setSidebarOpen(open); };
+  const text = (...parts) => el("div", {}, parts.map((p) => typeof p === "string" ? el("p", {}, p) : p));
+  const hasModel = Object.keys(state.user.keys).some((k) => k !== "tavily");
+  let tour;
+  const steps = [
+    { title: "Welcome to Paper Reader", before: sidebar(false), body: text(
+      "Read research papers next to an AI assistant that has the whole paper in front of it. This tour shows the main features in about a minute.",
+      "You can see it again any time from Settings → Walkthrough.") },
+    { title: hasModel ? "Your model" : "First, add an API key", before: sidebar(true),
+      target: () => $("settings-btn"), body: text(
+        state.user.is_admin
+          ? "You're an admin, so your questions use the API keys this server was deployed with. Settings is where you pick the provider and model."
+          : hasModel
+            ? "Your questions run on the API key you added. Settings is where you pick the provider and model, and manage your keys."
+            : "The assistant runs on your own key for a model provider (you pay the provider for what you use, usually cents per paper). OpenRouter is the quickest: one key works with Claude, GPT, Gemini and more, and turns on voice questions.",
+        hasModel ? null : el("button", { type: "button", class: "tour-inline", onclick: () => {
+          tour.hide();
+          showAccount(() => tour.resume());
+        } }, "Add a key now")) },
+    { title: "Open a paper", before: sidebar(false), target: () => $("paper-form"), body: text(
+      "Paste an arXiv link or ID (like 1706.03762) or any PDF URL and press Enter.",
+      "Or type a paper's title and pick it from the results.") },
+    { title: "Ask about any passage", target: () => visible($("pages")?.firstElementChild ? $("viewer") : null), body: text(
+      "Select text in the paper and a box pops up. Type your question and press Enter to start a new chat about that passage, or ⌘/Ctrl+Enter to ask in the current chat.",
+      "Or skip the selection and ask about the whole paper in the chat.") },
+    { title: "Follow references in one click", target: () => visible($("notation-btn"), $("paper-form")), body: text(
+      "Right after you open a paper, it's analyzed in the background (a minute or two). Then “Theorem 3.1”, “Eq. (5)”, “[18]” and the paper's symbols become links: click one to see what it refers to, or jump to a proof.",
+      "Notation and Elements list them all; Summarize writes a summary of the paper.") },
+    { title: "The chat", before: () => { if (!state.searchMode && phone.matches) setChatCollapsed(true); },
+      target: () => visible($("chat").querySelector(".chat-expand"), $("composer"), $("chat")), body: text(
+        "Answers stream in here. The assistant can search the web and arXiv and read the papers a paper cites; any paper it mentions opens in the reader with one click.",
+        "The 🎙 button asks by voice (with an OpenRouter key).") },
+    { title: "Find papers", before: sidebar(true), target: () => visible($("tab-searches")), body: text(
+      "With no paper open, the chat is a search session: describe a topic or a half-remembered title and the assistant finds papers for you.",
+      "Past searches are under Searches; the Paper Reader title starts a new one.") },
+    { title: "Your library", before: sidebar(true), target: () => visible($("history"), $("tab-papers")), body: text(
+      "Every paper you open is saved here with its chats. Make folders with + Folder and drag papers onto them.") },
+    { title: "Usage", before: sidebar(true), target: () => $("usage-btn"), body: text(
+      "What your questions and paper analyses have cost, by day, week or month, and by model.") },
+    { title: "You're set", before: sidebar(false), body: text(
+      "Try it on a classic: the paper that introduced the Transformer.",
+      el("button", { type: "button", class: "tour-inline", onclick: () => {
+        location.hash = openHash("1706.03762");
+        tour.resume(); // past the last step: ends the tour
+      } }, "Open “Attention Is All You Need”")) },
+  ];
+  tour = startTour(steps, { onClose: () => {
+    if (phone.matches) setSidebarOpen(false);
+    if (!state.user.tour_done) {
+      state.user.tour_done = true;
+      api("/api/account", { method: "PATCH", body: { tour_done: true } }).catch(() => {});
+    }
+  } });
+}
+
 // ---------------------------------------------------------------- Boot
 
+state.user = await signIn(); // resolves once someone is signed in; until then shows the sign-in page
 window.addEventListener("hashchange", route);
 await loadConfig().catch((e) => setStatus(`Config error: ${e.message}`));
 loadUsage();
 await route();
+if (!state.user.tour_done) walkthrough();

@@ -14,8 +14,7 @@ import wave
 import httpx
 
 from . import db, usage
-from .config import (HTTP_HEADERS, OPENROUTER_API_KEY, TRANSCRIBE_DRAFT_MODEL, TRANSCRIBE_LANGUAGE,
-                     TRANSCRIBE_MODEL)
+from .config import HTTP_HEADERS, TRANSCRIBE_DRAFT_MODEL, TRANSCRIBE_LANGUAGE, TRANSCRIBE_MODEL
 
 URL = "https://openrouter.ai/api/v1/audio/transcriptions"
 SAMPLE_RATE = 16000  # of the PCM the browser sends (static/mic-worklet.js)
@@ -27,15 +26,15 @@ PROMPT_PROVIDERS = ("deepinfra", "groq", "together")
 _SPOKEN_TERM = re.compile(r"[A-Za-z][A-Za-z0-9@'-]*(?: [A-Za-z0-9@'-]+){0,3}")  # not symbols like θ or d_k
 
 
-def available() -> bool:
-    return bool(OPENROUTER_API_KEY)
+def available(user: dict) -> bool:
+    return bool(user["keys"].get("openrouter"))
 
 
-def paper_prompt(paper_id: str | None) -> str | None:
-    paper = paper_id and db.get_paper(paper_id)
+def paper_prompt(user_id: str, paper_id: str | None) -> str | None:
+    paper = paper_id and db.get_paper(user_id, paper_id)
     if not paper:
         return None
-    glossary = db.get_analysis(paper_id, "glossary") or {}
+    glossary = db.get_analysis(user_id, paper_id, "glossary") or {}
     terms, seen = [], set()
     for t in glossary.get("entries") or {}:
         if _SPOKEN_TERM.fullmatch(t) and sum(c.isalpha() for c in t) > 1 and t.lower() not in seen:
@@ -59,7 +58,7 @@ def _wav(pcm16: bytes) -> bytes:
     return buf.getvalue()
 
 
-async def transcribe(pcm16: bytes, *, paper_id: str | None, context: str = "", draft: bool = False) -> str:
+async def transcribe(user: dict, pcm16: bytes, *, paper_id: str | None, context: str = "", draft: bool = False) -> str:
     """One phrase of a spoken question (16 kHz 16-bit mono PCM). context is the question's text so
     far. A draft is replaced soon anyway: a faster model, and no prompt, which a draft model is apt
     to read out as if it had been spoken."""
@@ -69,7 +68,7 @@ async def transcribe(pcm16: bytes, *, paper_id: str | None, context: str = "", d
     if TRANSCRIBE_LANGUAGE:
         body["language"] = TRANSCRIBE_LANGUAGE
     if not draft:
-        prompt = " ".join(p for p in (paper_prompt(paper_id), context[-CONTEXT_CHARS:]) if p)
+        prompt = " ".join(p for p in (paper_prompt(user["id"], paper_id), context[-CONTEXT_CHARS:]) if p)
         if prompt:
             body["provider"] = {"options": {p: {"prompt": prompt} for p in PROMPT_PROVIDERS}}
     # A phrase takes about a second; now and then a request stalls, and a second try is quicker.
@@ -77,7 +76,7 @@ async def transcribe(pcm16: bytes, *, paper_id: str | None, context: str = "", d
     async with httpx.AsyncClient(timeout=timeout, headers=HTTP_HEADERS) as client:
         for attempt in range(2):
             try:
-                r = await client.post(URL, json=body, headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"})
+                r = await client.post(URL, json=body, headers={"Authorization": f"Bearer {user['keys']['openrouter']}"})
             except httpx.TimeoutException:
                 if attempt:
                     raise RuntimeError(f"{model}: no answer from OpenRouter in {timeout:.0f} s") from None
@@ -92,7 +91,7 @@ async def transcribe(pcm16: bytes, *, paper_id: str | None, context: str = "", d
         raise RuntimeError(f"{model}: {message}")
     data = r.json()
     u = data.get("usage") or {}
-    await usage.record("openrouter", model, {
+    await usage.record(user["id"], "openrouter", model, {
         "input": u.get("input_tokens", 0), "output": u.get("output_tokens", 0), "cost": u.get("cost"),
     }, kind="transcription", paper_id=paper_id)
     return (data.get("text") or "").strip()

@@ -25,7 +25,7 @@ _ARXIV_URL = re.compile(
 )
 _BARE_ID = re.compile(rf"^(?:arxiv:)?({_NEW_ID}|{_OLD_ID})$", re.IGNORECASE)
 
-_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+_locks: dict[tuple[str, str], asyncio.Lock] = defaultdict(asyncio.Lock)  # by (user id, paper id)
 
 
 class PaperError(Exception):
@@ -49,9 +49,11 @@ def paper_id_for(source: str) -> tuple[str, str | None]:
     return "url-" + hashlib.sha1(source.strip().encode()).hexdigest()[:12], None
 
 
-def pdf_path(paper_id: str):
+def pdf_path(paper: dict):
+    """The paper's PDF, named by its SHA-256, so every user's copy of the paper shares the file.
+    (A paper from before PDFs were pinned has no hash; its file is named by its id.)"""
     PAPERS_DIR.mkdir(parents=True, exist_ok=True)  # a cache on Vercel: /tmp can be emptied
-    return PAPERS_DIR / (paper_id.replace("/", "_") + ".pdf")
+    return PAPERS_DIR / ((paper.get("pdf_sha256") or paper["id"].replace("/", "_")) + ".pdf")
 
 
 def pdf_url(paper: dict) -> str:
@@ -66,8 +68,13 @@ async def ensure_pdf(paper: dict):
     """The paper's PDF on disk, downloaded again if it's gone (on Vercel, /tmp is only a cache).
     A download that isn't the file the paper was made from is refused: the stored text, notation
     and elements describe that file (a web page's PDF can change; an arXiv version doesn't)."""
-    path = pdf_path(paper["id"])
+    path = pdf_path(paper)
     if not path.exists():
+        # Saved before files were named by their hash.
+        legacy = PAPERS_DIR / (paper["id"].replace("/", "_") + ".pdf")
+        if legacy.exists() and hashlib.sha256(legacy.read_bytes()).hexdigest() == paper.get("pdf_sha256"):
+            legacy.rename(path)
+            return path
         pdf = await download_pdf(pdf_url(paper))
         if paper.get("pdf_sha256") and hashlib.sha256(pdf).hexdigest() != paper["pdf_sha256"]:
             raise PaperError(f"The PDF at {pdf_url(paper)} has changed since this paper was added")
@@ -267,8 +274,8 @@ async def download_pdf(url: str) -> bytes:
     return r.content
 
 
-async def ingest(source: str, known: dict | None = None) -> dict:
-    """Download + extract a paper once; later calls return the stored copy.
+async def ingest(user_id: str, source: str, known: dict | None = None) -> dict:
+    """Download + extract a paper once into the user's library; later calls return the stored copy.
 
     known: title/authors/published for a non-arXiv PDF (e.g. from search), used instead of
     guessing them from the PDF.
@@ -276,22 +283,25 @@ async def ingest(source: str, known: dict | None = None) -> dict:
     The stored text is frozen at ingest time, so the paper message sent to the model is
     byte-identical across every conversation about this paper (keeps the prefix cache warm).
     """
-    if stored := db.get_paper(source.strip()):  # by its id, e.g. an archived version ("2210.02747v2")
+    if stored := db.get_paper(user_id, source.strip()):  # by its id, e.g. an archived version ("2210.02747v2")
         return stored
     paper_id, arxiv_id = paper_id_for(source)
-    async with _locks[paper_id]:
-        existing = db.get_paper(paper_id)
+    async with _locks[user_id, paper_id]:
+        existing = db.get_paper(user_id, paper_id)
         if existing:
             return existing
         paper, pdf_bytes = await _fetch(source, paper_id, arxiv_id, known)
-        pdf_path(paper_id).write_bytes(pdf_bytes)
-        db.insert_paper(paper)
-        return db.get_paper(paper_id)
+        if pdf_bytes:
+            pdf_path(paper).write_bytes(pdf_bytes)
+        db.insert_paper(user_id, paper)
+        return db.get_paper(user_id, paper_id)
 
 
-async def _fetch(source: str, paper_id: str, arxiv_id: str | None, known: dict | None = None) -> tuple[dict, bytes]:
+async def _fetch(source: str, paper_id: str, arxiv_id: str | None,
+                 known: dict | None = None) -> tuple[dict, bytes | None]:
     """The paper to store (not stored yet), and its PDF. For arXiv, the latest version, pinned:
-    pdf_url names that version, so the same file can be downloaded again."""
+    pdf_url names that version, so the same file can be downloaded again. When another user already
+    has that version, the paper is a copy of theirs, with its finished analyses, and the PDF None."""
     if arxiv_id:
         meta = await arxiv_metadata(arxiv_id)
         if meta is None:
@@ -299,6 +309,8 @@ async def _fetch(source: str, paper_id: str, arxiv_id: str | None, known: dict |
         version = meta["version"]
         pdf_url = f"https://arxiv.org/pdf/{arxiv_id}" + (f"v{version}" if version else "")
         source_url = meta["url"]
+        if version and (copy := db.pinned_copy(pdf_url)):
+            return {**copy, "id": paper_id, "folder_id": None}, None
     else:
         parsed = urlparse(source.strip())
         if parsed.scheme not in ("http", "https"):
@@ -329,28 +341,23 @@ async def _fetch(source: str, paper_id: str, arxiv_id: str | None, known: dict |
 ARCHIVE_FOLDER = "Archive"
 
 
-async def update_to_latest(paper_id: str) -> dict:
+async def update_to_latest(user_id: str, paper_id: str) -> dict:
     """Replaces the paper with arXiv's latest version, processed like a new paper. The version
     it was becomes a paper of its own, "<id>v<version>", with its conversations, in the Archive
-    folder. The new version is downloaded first, so a failure leaves everything as it was."""
-    from . import figures  # figures imports this module
-
-    async with _locks[paper_id]:
-        paper = db.get_paper(paper_id)
+    folder. The new version is downloaded first, so a failure leaves everything as it was.
+    (The PDF files stay where they are: they're named by their hash.)"""
+    async with _locks[user_id, paper_id]:
+        paper = db.get_paper(user_id, paper_id)
         if not paper or not paper.get("arxiv_version") or archived(paper_id):
             raise PaperError("Only the current version of an arXiv paper can be updated")
         new, pdf_bytes = await _fetch(paper_id, paper_id, paper_id)
         if new["arxiv_version"] <= paper["arxiv_version"]:
             raise PaperError(f"v{paper['arxiv_version']} is already the latest version")
         archived_id = f"{paper_id}v{paper['arxiv_version']}"
-        if db.get_paper(archived_id):
+        if db.get_paper(user_id, archived_id):
             raise PaperError(f"{archived_id} is already in the library")
-        # The files are caches of pinned downloads: one left behind is downloaded again.
-        for old, kept in ((pdf_path(paper_id), pdf_path(archived_id)),
-                          (figures.crops_dir(paper_id), figures.crops_dir(archived_id))):
-            if old.exists():
-                old.rename(kept)
-        db.archive_and_replace(paper_id, archived_id, db.top_folder(ARCHIVE_FOLDER), new)
-        pdf_path(paper_id).write_bytes(pdf_bytes)
+        db.archive_and_replace(user_id, paper_id, archived_id, db.top_folder(user_id, ARCHIVE_FOLDER), new)
+        if pdf_bytes:
+            pdf_path(new).write_bytes(pdf_bytes)
         db.set_latest_version(paper_id, new["arxiv_version"])
-        return db.get_paper(paper_id)
+        return db.get_paper(user_id, paper_id)
