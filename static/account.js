@@ -31,6 +31,12 @@ const GOOGLE_G = `<svg viewBox="0 0 48 48" width="18" height="18" aria-hidden="t
   <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/>
 </svg>`;
 
+// The same icon as Sign out in the Settings popover (index.html).
+const SIGN_OUT_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+  stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+  <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5M21 12H9"/>
+</svg>`;
+
 // ---------------------------------------------------------------- Signing in
 
 // The signed-in user. Until there is one, the sign-in page is shown and this never resolves:
@@ -201,6 +207,8 @@ export function openAccount(user, { onChange, onClose } = {}) {
 
   const render = () => {
     const how = [user.google && "Google", user.has_password && "password"].filter(Boolean).join(" or ");
+    const signOutBtn = el("button", { type: "button", class: "account-signout", onclick: () => signOut() });
+    signOutBtn.innerHTML = `${SIGN_OUT_ICON}<span>Sign out</span>`;
     const rows = KEYS.map((k) => keyRow(k, user, async (value) => {
       user = await post("/api/account", { keys: { [k.id]: value } }, "PATCH");
       onChange?.(user);
@@ -208,9 +216,11 @@ export function openAccount(user, { onChange, onClose } = {}) {
     }));
     body.replaceChildren(
       el("div", { class: "account-who" },
-        el("div", {}, el("strong", {}, user.name || user.username || user.email),
-          user.is_admin ? el("span", { class: "badge" }, "admin") : null),
-        el("div", { class: "muted" }, user.email, how ? ` · signs in with ${how}` : "")),
+        el("div", { class: "account-who-text" },
+          el("div", {}, el("strong", {}, user.name || user.username || user.email),
+            user.is_admin ? el("span", { class: "badge" }, "admin") : null),
+          el("div", { class: "muted" }, user.email, how ? ` · signs in with ${how}` : "")),
+        signOutBtn),
       el("h3", {}, "API keys"),
       el("p", { class: "muted account-intro" }, user.is_admin
         ? "As an admin you use the keys this server was deployed with (marked “server”). A key you add here is used only for a provider the server has no key for."

@@ -850,22 +850,40 @@ body.signed-out #app { visibility: hidden; }
 .auth-row { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .auth-note { font-size: calc(12px * var(--ui-scale)); }
 
-/* Account, in the Settings popover */
-.account-summary { font-size: calc(12.5px * var(--ui-scale)); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.account-actions { display: flex; flex-wrap: wrap; gap: 6px; }
-.account-actions button {
-  padding: 3px 9px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg);
-  cursor: pointer; font-size: calc(12px * var(--ui-scale));
+/* Account: the user's initial before the title in the sidebar's head, opening a menu below it */
+.sidebar-head .brand { margin-right: auto; }
+.user-wrap { position: relative; flex: none; display: flex; }
+.user-btn { padding: 0; border: 0; border-radius: 50%; background: none; cursor: pointer; }
+.user-initial {
+  display: grid; place-items: center; width: calc(24px * var(--ui-scale)); height: calc(24px * var(--ui-scale));
+  border-radius: 50%; background: var(--accent-soft); color: var(--accent);
+  font-size: calc(12px * var(--ui-scale)); font-weight: 600;
 }
-.account-actions button:hover { border-color: var(--accent); color: var(--accent); }
-.settings-pop-sep { border-top: 1px solid var(--border); padding-top: 8px; margin-top: 2px; }
+.user-btn:hover .user-initial, .user-btn.open .user-initial { box-shadow: 0 0 0 2px var(--accent); }
+.user-pop { top: calc(100% + 8px); bottom: auto; width: 240px; gap: 6px; padding: 8px 6px; }
+.account-summary { padding: 2px 8px 6px; border-bottom: 1px solid var(--border); font-size: calc(12.5px * var(--ui-scale)); }
+.account-summary > div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.account-actions { display: flex; flex-direction: column; }
+.account-actions button {
+  display: flex; align-items: center; gap: 8px; width: 100%; padding: 6px 8px; border: 0; border-radius: 6px;
+  background: none; cursor: pointer; text-align: left; font-size: calc(13px * var(--ui-scale));
+}
+.account-actions button:hover { background: rgba(127, 127, 127, 0.12); }
+.account-actions svg { flex: none; width: calc(15px * var(--ui-scale)); height: calc(15px * var(--ui-scale)); color: var(--muted); }
+.account-signout svg { flex: none; width: calc(13px * var(--ui-scale)); height: calc(13px * var(--ui-scale)); }
 
 /* Account panel: the user's API keys */
 .account-modal { width: min(560px, 100%); }
 .modal-head-fill { flex: 1; }
 .account-body { padding: 4px 16px 18px; overflow: auto; }
 .account-body h3 { margin: 16px 0 4px; font-size: calc(14px * var(--ui-scale)); }
-.account-who { padding: 12px 0 4px; display: flex; flex-direction: column; gap: 2px; }
+.account-who { padding: 12px 0 4px; display: flex; align-items: center; gap: 12px; }
+.account-who-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; overflow-wrap: anywhere; }
+.account-signout {
+  flex: none; display: inline-flex; align-items: center; gap: 6px; padding: 4px 11px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg);
+  cursor: pointer; font-size: calc(12.5px * var(--ui-scale));
+}
+.account-signout:hover { border-color: var(--accent); color: var(--accent); }
 .account-intro { margin: 0 0 6px; font-size: calc(12.5px * var(--ui-scale)); line-height: 1.45; }
 .badge {
   display: inline-block; margin-left: 6px; padding: 1px 7px; border-radius: 999px; vertical-align: 1px;

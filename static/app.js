@@ -1435,8 +1435,11 @@ async function loadConfig() {
 function showUser(user) {
   state.user = user;
   const who = user.name || user.username || user.email;
-  $("account-summary").textContent = user.is_admin ? `${who} · admin` : who;
-  $("account-summary").title = user.email;
+  $("user-initial").textContent = who.trim().charAt(0).toUpperCase();
+  $("user-btn").title = who === user.email ? `Your account: ${who}` : `Your account: ${who} (${user.email})`;
+  $("account-summary").replaceChildren(
+    el("div", {}, el("strong", {}, who), user.is_admin ? el("span", { class: "badge" }, "admin") : null),
+    who === user.email ? null : el("div", { class: "muted", title: user.email }, user.email));
   // Without a key for any model provider there's nothing to ask (Tavily alone isn't one).
   const hasModel = Object.keys(user.keys).some((k) => k !== "tavily");
   $("key-callout").hidden = hasModel;
@@ -1444,13 +1447,27 @@ function showUser(user) {
 
 // Saving or removing a key changes the providers on offer (and whether voice works).
 function showAccount(onClose) {
-  toggleSettings(false);
+  toggleUserMenu(false);
   openAccount(state.user, { onChange: (user) => { showUser(user); loadConfig().catch(() => {}); }, onClose });
 }
 $("account-btn").onclick = () => showAccount();
 $("key-callout-btn").onclick = () => showAccount();
 $("signout-btn").onclick = () => signOut();
-$("tour-btn").onclick = () => { toggleSettings(false); walkthrough(); };
+$("tour-btn").onclick = () => { toggleUserMenu(false); walkthrough(); };
+
+// The user's initial, at the top of the sidebar, opens the account options.
+function toggleUserMenu(open = $("user-pop").hidden) {
+  $("user-pop").hidden = !open;
+  $("user-btn").setAttribute("aria-expanded", String(open));
+  $("user-btn").classList.toggle("open", open);
+}
+$("user-btn").onclick = () => toggleUserMenu();
+document.addEventListener("pointerdown", (e) => {
+  if (!$("user-pop").hidden && !$("user-wrap").contains(e.target)) toggleUserMenu(false);
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !$("user-pop").hidden) toggleUserMenu(false);
+});
 
 async function setProvider(providerId, model) {
   $("provider").value = providerId;
@@ -2805,7 +2822,7 @@ fitPlaceholder();
 
 // ---------------------------------------------------------------- Walkthrough
 
-// The first time someone signs in, and again from Settings → Walkthrough. Steps point at what's on
+// The first time someone signs in, and again from the account menu → Walkthrough. Steps point at what's on
 // screen; on a phone, the sidebar's steps open its drawer first.
 function walkthrough() {
   const visible = (...nodes) => nodes.find((n) => n && n.getBoundingClientRect().width > 0) || null;
@@ -2816,13 +2833,13 @@ function walkthrough() {
   const steps = [
     { title: "Welcome to Paper Reader", before: sidebar(false), body: text(
       "Read research papers next to an AI assistant that has the whole paper in front of it. This tour shows the main features in about a minute.",
-      "You can see it again any time from Settings → Walkthrough.") },
+      "You can see it again any time: click your initial at the top of the sidebar, then Walkthrough.") },
     { title: hasModel ? "Your model" : "First, add an API key", before: sidebar(true),
-      target: () => $("settings-btn"), body: text(
+      target: () => $(hasModel ? "settings-btn" : "user-btn"), body: text(
         state.user.is_admin
           ? "You're an admin, so your questions use the API keys this server was deployed with. Settings is where you pick the provider and model."
           : hasModel
-            ? "Your questions run on the API key you added. Settings is where you pick the provider and model, and manage your keys."
+            ? "Your questions run on the API key you added. Settings is where you pick the provider and model; your keys are under your initial, at the top of the sidebar."
             : "The assistant runs on your own key for a model provider (you pay the provider for what you use, usually cents per paper). OpenRouter is the quickest: one key works with Claude, GPT, Gemini and more, and turns on voice questions.",
         hasModel ? null : el("button", { type: "button", class: "tour-inline", onclick: () => {
           tour.hide();

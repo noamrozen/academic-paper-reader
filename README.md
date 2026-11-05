@@ -4,8 +4,8 @@ Read arXiv papers next to an LLM research assistant. Paste a link, highlight a p
 
 - **Accounts:** sign up with a username, email and password (the email is confirmed by a link), or
   with Google. Each user has their own library, folders, chats and Usage, and brings their own API
-  keys (Settings → **API keys…**), stored encrypted. Admins (`ADMIN_EMAILS`) use the server's keys
-  from `.env` instead. A first sign-in starts a short **walkthrough** of the app (Settings →
+  keys (their initial at the top of the sidebar → **API keys…**), stored encrypted. Admins (`ADMIN_EMAILS`) use the server's keys
+  from `.env` instead. A first sign-in starts a short **walkthrough** of the app (the initial →
   **Walkthrough** shows it again). See [Accounts](#accounts) for setting this up.
 
 - Paste an arXiv link or ID (`https://arxiv.org/abs/1706.03762`, `arxiv.org/pdf/1706.03762v7`, `1706.03762`, or any direct PDF URL) and press Enter. The paper is downloaded, its text is extracted, and the PDF is rendered with selectable text.
@@ -128,7 +128,7 @@ or `.env` locally):
   one in `data/secret_key`.
 - `ADMIN_EMAILS`: comma-separated. A user whose confirmed email is listed is an admin: their
   requests use the server's provider keys (`OPENROUTER_API_KEY`, ...). Everyone else adds their own
-  keys under Settings → API keys…, which are checked with the provider before they're saved.
+  keys under their initial (top of the sidebar) → API keys…, which are checked with the provider before they're saved.
 - The library from before accounts (papers, folders, chats, spending) has no owner until the first
   admin signs in, and then becomes theirs.
 

@@ -22,6 +22,32 @@
   <div id="app">
     <aside id="sidebar">
       <div class="sidebar-head">
+        <div id="user-wrap" class="user-wrap">
+          <div id="user-pop" class="settings-pop user-pop" hidden>
+            <div id="account-summary" class="account-summary"></div>
+            <div class="account-actions" role="menu">
+              <button role="menuitem" id="account-btn" type="button" title="Your account and API keys">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                  stroke-linejoin="round" aria-hidden="true"><circle cx="7.5" cy="15.5" r="5.5"/><path d="m21 2-9.6 9.6M15.5 7.5l3 3L22 7l-3-3"/></svg>
+                API keys…
+              </button>
+              <button role="menuitem" id="tour-btn" type="button" title="Show the walkthrough of the app again">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                  stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="m16.24 7.76-2.12 6.36-6.36 2.12 2.12-6.36z"/></svg>
+                Walkthrough
+              </button>
+              <button role="menuitem" id="signout-btn" type="button">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                  stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5M21 12H9"/></svg>
+                Sign out
+              </button>
+            </div>
+          </div>
+          <button id="user-btn" type="button" class="user-btn" title="Your account"
+            aria-haspopup="menu" aria-expanded="false" aria-controls="user-pop">
+            <span id="user-initial" class="user-initial" aria-hidden="true"></span>
+          </button>
+        </div>
         <a href="#/" class="brand">Paper Reader</a>
         <button id="new-folder" type="button" class="new-folder" title="New folder">+ Folder</button>
         <button id="new-search" type="button" class="new-folder" title="Start a new search session" hidden>+ Search</button>
@@ -38,14 +64,7 @@
       <div class="sidebar-foot">
         <div id="settings-wrap" class="settings-wrap">
           <div id="settings-pop" class="settings-pop" hidden>
-            <div class="settings-pop-head">Account</div>
-            <div id="account-summary" class="account-summary muted"></div>
-            <div class="account-actions">
-              <button id="account-btn" type="button" title="Your account and API keys">API keys…</button>
-              <button id="tour-btn" type="button" title="Show the walkthrough of the app again">Walkthrough</button>
-              <button id="signout-btn" type="button">Sign out</button>
-            </div>
-            <div class="settings-pop-head settings-pop-sep">Model</div>
+            <div class="settings-pop-head">Model</div>
             <label class="setting">Provider <select id="provider"></select></label>
             <label class="setting">Model <input id="model" list="model-list" spellcheck="false"></label>
             <datalist id="model-list"></datalist>
