@@ -573,12 +573,19 @@ details.tool.error summary { color: var(--accent); }
 .cursor::after { content: "▍"; animation: blink 1s steps(2) infinite; color: var(--accent); }
 @keyframes blink { 50% { opacity: 0; } }
 
-#composer { border-top: 1px solid var(--border); padding: 10px 12px; }
+#composer { padding: 16px 12px 12px; }
 .composer-row { display: flex; gap: 8px; align-items: flex-end; }
+/* One line, boxed like the mic and Send buttons beside it (same vertical padding, border and line height)
+   so they are equally tall; fitQuestion (app.js) grows it as its text wraps */
 #question {
-  flex: 1; resize: none; border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px;
-  background: var(--bg); outline: none; max-height: 200px;
+  flex: 1; resize: none; border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px;
+  background: var(--bg); outline: none; max-height: 200px; line-height: normal; overflow-y: auto;
 }
+.composer-row :is(#send, #stop) { padding: 8px 14px; border-radius: 8px; }
+.composer-row button.mic { padding: 8px 10px; border-radius: 8px; }
+/* An empty line of body text, so the mic is as tall as Send with only its icon; the margin cancels the flex gap */
+.composer-row button.mic::before { content: "\200b"; font-size: 1rem; margin-right: -4px; }
+#question::placeholder { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 #question:focus { border-color: var(--accent); }
 .pending-selection {
   display: flex; gap: 8px; align-items: flex-start; font-size: calc(12px * var(--ui-scale)); color: var(--muted);

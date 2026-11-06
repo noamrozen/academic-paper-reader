@@ -2213,7 +2213,7 @@ function searchIntro() {
     el("p", {}, "Ask the assistant to look up papers for you: a topic, a half-remembered title, related work. "
       + "It searches arXiv and the web and links every paper it finds; click a link to open the paper in the reader."),
     el("div", { class: "search-examples" }, SEARCH_EXAMPLES.map((q) => el("button", {
-      type: "button", class: "search-example", onclick: () => { $("question").value = q; $("question").focus(); },
+      type: "button", class: "search-example", onclick: () => { $("question").value = q; fitQuestion(); $("question").focus(); },
     }, q))),
     el("p", { class: "muted" }, "To open a paper directly, paste its link above. Past searches are under Searches in the sidebar."));
 }
@@ -2630,10 +2630,21 @@ $("composer").addEventListener("submit", (e) => {
   const q = $("question").value.trim();
   if (!q || state.streaming) return; // keep a question typed during an answer for later
   $("question").value = "";
+  fitQuestion();
   const sel = state.pendingSelection;
   setPendingSelection(null);
   sendQuestion(q, sel);
 });
+// The chat box is one line tall (CSS) until its text wraps or has newlines, then grows with it up to its max-height.
+function fitQuestion() {
+  const q = $("question");
+  q.style.height = "";
+  // Hidden, empty (a wrapped placeholder counts toward scrollHeight), or fits on its line.
+  if (!q.offsetParent || !q.value || q.scrollHeight <= q.clientHeight) return;
+  q.style.height = `${q.scrollHeight + q.offsetHeight - q.clientHeight}px`;
+}
+$("question").addEventListener("input", fitQuestion);
+window.addEventListener("resize", fitQuestion);
 $("question").addEventListener("keydown", (e) => {
   if (e.key === "Escape" && state.streaming) state.abort?.abort();
   if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
