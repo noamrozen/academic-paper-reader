@@ -276,12 +276,25 @@ function showAnalysis(a) {
         },
       }, resume ? "Continue" : "Retry");
     }
-    return el("li", { class: `stage ${kind}` },
+    const li = el("li", { class: `stage ${kind}` },
       el("span", { class: "stage-icon", "aria-hidden": "true" }, { done: "✓", failed: "!", waiting: "·" }[kind] || ""),
       el("span", { class: "stage-text" }, el("strong", {}, s.label), el("span", { class: "muted" }, s.desc), reason),
       el("span", { class: "stage-side" }, el("span", { class: "stage-state" }, text), retry));
+    if (n) {
+      // Opens the same panel as the toolbar button, with whatever has been generated so far.
+      const open = () => { toggleAnalysisPop(false); STAGE_PANELS[s.key](); };
+      li.classList.add("openable");
+      Object.assign(li, { tabIndex: 0, title: `Show the ${n} ${s.unit} ${status === "pending" ? "generated so far" : "found"}` });
+      li.setAttribute("role", "button");
+      li.onclick = (e) => { if (!e.target.closest(".stage-retry")) open(); };
+      li.onkeydown = (e) => { if ((e.key === "Enter" || e.key === " ") && e.target === li) { e.preventDefault(); open(); } };
+    }
+    return li;
   }));
 }
+
+// Each lookup's panel, opened from its row in the popover.
+const STAGE_PANELS = { glossary: () => openNotation(), refs: () => openElements(), bib: () => openBib() };
 
 function toggleAnalysisPop(open = $("analysis-pop").hidden) {
   $("analysis-pop").hidden = !open;
@@ -304,6 +317,7 @@ function setRefs(entries) {
   const n = Object.keys(entries).length;
   $("elements-btn").hidden = !n;
   $("elements-btn").textContent = `Elements (${n})`;
+  if (!$("elements-modal").hidden) renderElements(); // open while the lookup streams in
 }
 
 const KIND_PLURALS = { hypothesis: "hypotheses" };
@@ -311,6 +325,15 @@ let elementsKind = ""; // the kind chip selected in the panel ("" = all)
 
 // "Elements" panel: every numbered element in reading order (by page, then as the model listed them).
 function openElements() {
+  $("elements-filter").value = "";
+  renderElements();
+  $("elements-modal").hidden = false;
+  $("elements-list").scrollTop = 0;
+  $("elements-filter").focus();
+}
+
+// Fills the panel, keeping the filter text and kind chip (re-run as entries arrive).
+function renderElements() {
   const items = Object.values(state.refs || {})
     .map((e, i) => ({ e, i }))
     .sort((a, b) => (a.e.page ?? Infinity) - (b.e.page ?? Infinity) || a.i - b.i)
@@ -354,11 +377,7 @@ function openElements() {
     item.dataset.search = `${ref.label} ${ref.content}`.toLowerCase();
     return item;
   }));
-  $("elements-filter").value = "";
   filterElements();
-  $("elements-modal").hidden = false;
-  $("elements-list").scrollTop = 0;
-  $("elements-filter").focus();
 }
 
 function filterElements() {
@@ -459,10 +478,19 @@ function setGlossary(entries) {
   state.glossary = { exact, folded, entries: Object.entries(entries) };
   $("notation-btn").hidden = !state.glossary.entries.length;
   $("notation-btn").textContent = `Notation (${state.glossary.entries.length})`;
+  if (!$("notation-modal").hidden) renderNotation(); // open while the lookup streams in
 }
 
 // "Notation" panel: every glossary entry, in the order the model listed them (roughly paper order).
 function openNotation() {
+  $("notation-filter").value = "";
+  renderNotation();
+  $("notation-modal").hidden = false;
+  $("notation-list").scrollTop = 0;
+  $("notation-filter").focus();
+}
+
+function renderNotation() {
   const list = $("notation-list");
   list.replaceChildren();
   for (const [term, description] of state.glossary?.entries || []) {
@@ -472,10 +500,7 @@ function openNotation() {
     dt.dataset.search = dd.dataset.search = normTerm(`${term} ${description}`).toLowerCase();
     list.append(dt, dd);
   }
-  $("notation-filter").value = "";
   filterNotation();
-  $("notation-modal").hidden = false;
-  $("notation-filter").focus();
 }
 
 function filterNotation() {
@@ -705,7 +730,55 @@ function setBib(entries) {
     }
   }
   state.bib = { entries, byNumber, byAuthorYear };
+  if (!$("bib-modal").hidden) renderBib(); // open while the lookup streams in
 }
+
+// "References" panel: the bibliography as extracted so far, in the paper's order.
+function openBib() {
+  $("bib-filter").value = "";
+  renderBib();
+  $("bib-modal").hidden = false;
+  $("bib-list").scrollTop = 0;
+  $("bib-filter").focus();
+}
+
+function renderBib() {
+  $("bib-list").replaceChildren(...Object.values(state.bib?.entries || {}).map((e) => {
+    const source = e.arxiv_id || (e.url && /\.pdf($|\?)/i.test(e.url) ? e.url : null);
+    const title = source
+      ? el("a", { class: "cite-title", href: openHash(source), title: "Open this paper in the reader (new session)",
+          onclick: () => closeBib() }, e.title)
+      : el("span", { class: "cite-title" }, e.title);
+    const meta = [e.year, e.venue].filter(Boolean).join(" · ");
+    const item = el("div", { class: "cite-entry" },
+      e.number ? el("span", { class: "cite-num" }, `[${e.number}]`) : null,
+      el("div", { class: "cite-body" }, title,
+        el("div", { class: "cite-authors" }, citeAuthors(e.authors)),
+        meta ? el("div", { class: "cite-meta" }, meta) : null));
+    item.dataset.search = `${e.number || ""} ${e.title} ${(e.authors || []).join(" ")} ${meta}`.toLowerCase();
+    return item;
+  }));
+  filterBib();
+}
+
+function filterBib() {
+  const q = $("bib-filter").value.trim().toLowerCase();
+  let shown = 0;
+  for (const node of $("bib-list").children) {
+    node.hidden = !!q && !node.dataset.search.includes(q);
+    if (!node.hidden) shown++;
+  }
+  $("bib-empty").hidden = shown > 0;
+}
+
+function closeBib() { $("bib-modal").hidden = true; }
+
+$("bib-close").onclick = closeBib;
+$("bib-filter").addEventListener("input", filterBib);
+$("bib-modal").addEventListener("pointerdown", (e) => { if (e.target === $("bib-modal")) closeBib(); });
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !$("bib-modal").hidden) closeBib();
+});
 
 // Entry ids cited by a short selection: "[18]", "[9, 18]", "[16–18]", a bare "18", or author-year
 // forms such as "Kalchbrenner et al., 2016" and "(Bahdanau et al. 2014; Luong et al. 2015)".
