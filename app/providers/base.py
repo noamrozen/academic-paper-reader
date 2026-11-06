@@ -20,6 +20,14 @@ from dataclasses import dataclass, field
 from typing import AsyncIterator
 
 
+class ProviderError(RuntimeError):
+    """An error a provider reported, with its HTTP-like status when it gave one (429: slow down)."""
+
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status_code = status
+
+
 @dataclass
 class TextDelta:
     text: str

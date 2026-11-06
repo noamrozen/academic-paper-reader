@@ -30,11 +30,11 @@ def available(user: dict) -> bool:
     return bool(user["keys"].get("openrouter"))
 
 
-def paper_prompt(user_id: str, paper_id: str | None) -> str | None:
-    paper = paper_id and db.get_paper(user_id, paper_id)
+async def paper_prompt(user_id: str, paper_id: str | None) -> str | None:
+    paper = paper_id and await db.aio.get_paper(user_id, paper_id)
     if not paper:
         return None
-    glossary = db.get_analysis(user_id, paper_id, "glossary") or {}
+    glossary = await db.aio.get_analysis(user_id, paper_id, "glossary") or {}
     terms, seen = [], set()
     for t in glossary.get("entries") or {}:
         if _SPOKEN_TERM.fullmatch(t) and sum(c.isalpha() for c in t) > 1 and t.lower() not in seen:
@@ -68,7 +68,7 @@ async def transcribe(user: dict, pcm16: bytes, *, paper_id: str | None, context:
     if TRANSCRIBE_LANGUAGE:
         body["language"] = TRANSCRIBE_LANGUAGE
     if not draft:
-        prompt = " ".join(p for p in (paper_prompt(user["id"], paper_id), context[-CONTEXT_CHARS:]) if p)
+        prompt = " ".join(p for p in (await paper_prompt(user["id"], paper_id), context[-CONTEXT_CHARS:]) if p)
         if prompt:
             body["provider"] = {"options": {p: {"prompt": prompt} for p in PROMPT_PROVIDERS}}
     # A phrase takes about a second; now and then a request stalls, and a second try is quicker.

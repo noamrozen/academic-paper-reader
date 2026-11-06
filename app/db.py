@@ -1,12 +1,16 @@
 """SQLite persistence for papers, conversations and messages: a local file, or Turso (turso.py)."""
 
+import asyncio
 import json
+import logging
 import sqlite3
 import time
 import uuid
 from contextlib import contextmanager
 
 from .config import DB_PATH, TURSO_AUTH_TOKEN, TURSO_DATABASE_URL
+
+log = logging.getLogger(__name__)
 
 # Everything a user makes is theirs: their library, folders, chats and spending carry their user_id.
 # Rows from before accounts have user_id '' until the first admin signs in and claims them.
@@ -108,7 +112,34 @@ CREATE TABLE IF NOT EXISTS usage (  -- one row per model call: chat answers and 
     user_id TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, id);
+CREATE TABLE IF NOT EXISTS throttles (  -- request pacing shared by every server instance (reserve_slot)
+    key TEXT PRIMARY KEY,
+    next_at REAL NOT NULL           -- when the next request may start (Unix time)
+);
+CREATE TABLE IF NOT EXISTS arxiv_meta (  -- arXiv's metadata for papers looked up so far, shared by all users
+    arxiv_id TEXT PRIMARY KEY,      -- without version
+    version INTEGER,                -- the latest version when fetched
+    title TEXT NOT NULL,
+    title_key TEXT NOT NULL,        -- the title's words, lowercased (papers.title_key), for lookups by title
+    authors TEXT NOT NULL,          -- JSON list
+    abstract TEXT NOT NULL,
+    published TEXT NOT NULL,
+    updated TEXT NOT NULL,
+    fetched_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_arxiv_meta_title ON arxiv_meta(title_key);
 """
+# Locks with an expiry, for work that must run once across server instances (a paper's analysis,
+# a migration). Made before anything else, since migrate() takes one.
+LEASES_TABLE = """
+CREATE TABLE IF NOT EXISTS leases (
+    key TEXT PRIMARY KEY,
+    holder TEXT NOT NULL,
+    expires_at REAL NOT NULL
+)"""
+# Bump when init's migrations change the schema: a server starting on a database already at this
+# version skips them (one query instead of a dozen round trips to Turso on every cold start).
+SCHEMA_VERSION = 2
 # After the migrations in init(), which add the columns to older databases.
 INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_conv_paper ON conversations(user_id, paper_id, updated_at);
@@ -135,7 +166,39 @@ def connect():
         conn.close()
 
 
+def schema_version() -> int:
+    with connect() as conn:
+        try:
+            row = conn.execute("SELECT version FROM schema_meta").fetchone()
+        except Exception:  # no schema_meta yet (sqlite3 and libsql raise different errors)
+            return 0
+    return row[0] if row else 0
+
+
 def init():
+    """Brings the database to SCHEMA_VERSION; only one server instance migrates at a time (the
+    others wait for it). Run at startup, and by `python -m app.migrate`."""
+    if schema_version() == SCHEMA_VERSION:
+        return
+    with connect() as conn:
+        conn.execute(LEASES_TABLE)
+    holder = uuid.uuid4().hex
+    deadline = time.time() + 120
+    while not acquire_lease("migrate", holder, ttl=120):
+        if time.time() > deadline:
+            raise RuntimeError("Another server instance has been migrating the database for 2 minutes")
+        time.sleep(1)
+        if schema_version() == SCHEMA_VERSION:
+            return
+    try:
+        if schema_version() != SCHEMA_VERSION:
+            _migrate()
+            log.info("Database migrated to schema version %d", SCHEMA_VERSION)
+    finally:
+        release_lease("migrate", holder)
+
+
+def _migrate():
     with connect() as conn:
         had_usage = conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'usage'").fetchone()
         conn.executescript(SCHEMA)
@@ -163,6 +226,9 @@ def init():
             _add_user_ids(conn)
         for statement in filter(str.strip, INDEXES.split(";")):
             conn.execute(statement)
+        conn.execute("CREATE TABLE IF NOT EXISTS schema_meta (version INTEGER NOT NULL)")
+        conn.execute("DELETE FROM schema_meta")
+        conn.execute("INSERT INTO schema_meta (version) VALUES (?)", (SCHEMA_VERSION,))
 
 
 def _backfill_usage(conn):
@@ -652,3 +718,99 @@ def take_email_token(token_hash: str, purpose: str) -> str | None:
                            (token_hash, purpose, time.time())).fetchone()
         conn.execute("DELETE FROM email_tokens WHERE token_hash = ?", (token_hash,))
     return row["user_id"] if row else None
+
+
+# ---------------------------------------------------------------- leases and pacing
+
+def acquire_lease(key: str, holder: str, ttl: float) -> bool:
+    """Takes the lease, or renews it for its holder. False while someone else holds it unexpired."""
+    now = time.time()
+    with connect() as conn:
+        row = conn.execute(
+            """INSERT INTO leases (key, holder, expires_at) VALUES (?, ?, ?)
+               ON CONFLICT(key) DO UPDATE SET holder = excluded.holder, expires_at = excluded.expires_at
+               WHERE leases.expires_at < ? OR leases.holder = excluded.holder
+               RETURNING holder""", (key, holder, now + ttl, now)).fetchone()
+    return row is not None
+
+
+def release_lease(key: str, holder: str):
+    with connect() as conn:
+        conn.execute("DELETE FROM leases WHERE key = ? AND holder = ?", (key, holder))
+
+
+def active_leases(keys: list[str]) -> set[str]:
+    """Which of these leases someone holds now."""
+    if not keys:
+        return set()
+    with connect() as conn:
+        rows = conn.execute(f"SELECT key FROM leases WHERE key IN ({','.join('?' * len(keys))}) AND expires_at >= ?",
+                            (*keys, time.time())).fetchall()
+    return {r["key"] for r in rows}
+
+
+def reserve_slot(key: str, interval: float) -> float:
+    """Reserves the next start time for a request paced at one per interval seconds, across every
+    server instance: returns when this request may start (Unix time; now, or later)."""
+    now = time.time()
+    with connect() as conn:
+        next_at = conn.execute(
+            """INSERT INTO throttles (key, next_at) VALUES (?, ?)
+               ON CONFLICT(key) DO UPDATE SET next_at = MAX(throttles.next_at, ?) + ?
+               RETURNING next_at""", (key, now + interval, now, interval)).fetchone()[0]
+    return next_at - interval
+
+
+# ---------------------------------------------------------------- arXiv metadata
+
+def get_arxiv_meta(arxiv_ids: list[str]) -> dict[str, dict]:
+    if not arxiv_ids:
+        return {}
+    with connect() as conn:
+        rows = conn.execute(f"SELECT * FROM arxiv_meta WHERE arxiv_id IN ({','.join('?' * len(arxiv_ids))})",
+                            tuple(arxiv_ids)).fetchall()
+    return {r["arxiv_id"]: _arxiv_meta_row(r) for r in rows}
+
+
+def find_arxiv_meta(title_key: str) -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute("SELECT * FROM arxiv_meta WHERE title_key = ? LIMIT 5", (title_key,)).fetchall()
+    return [_arxiv_meta_row(r) for r in rows]
+
+
+def _arxiv_meta_row(r) -> dict:
+    d = dict(r)
+    d["authors"] = json.loads(d["authors"])
+    return d
+
+
+def put_arxiv_meta(rows: list[dict]):
+    """rows: papers.arxiv_query results, each with its title_key."""
+    now = time.time()
+    with connect() as conn:
+        conn.executemany(
+            """INSERT INTO arxiv_meta (arxiv_id, version, title, title_key, authors, abstract, published, updated, fetched_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(arxiv_id) DO UPDATE SET version = excluded.version, title = excluded.title,
+                   title_key = excluded.title_key, authors = excluded.authors, abstract = excluded.abstract,
+                   published = excluded.published, updated = excluded.updated, fetched_at = excluded.fetched_at""",
+            [(r["arxiv_id"], r["version"], r["title"], r["title_key"], json.dumps(r["authors"]), r["abstract"],
+              r["published"], r["updated"], now) for r in rows])
+
+
+# ---------------------------------------------------------------- for async code
+
+class _InThread:
+    """This module's functions as coroutines that run in a worker thread: `await db.aio.get_paper(...)`.
+    Async code uses these, so a query (on Turso, a network round trip) doesn't stall every other
+    request the server is handling."""
+
+    def __getattr__(self, name):
+        fn = globals()[name]
+
+        async def call(*args, **kwargs):
+            return await asyncio.to_thread(fn, *args, **kwargs)
+        return call
+
+
+aio = _InThread()

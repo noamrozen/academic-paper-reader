@@ -7,8 +7,8 @@ import re
 import httpx
 from bs4 import BeautifulSoup
 
-from . import papers
-from .config import HTTP_HEADERS
+from . import db, net, papers
+from .config import MAX_PAGE_BYTES
 
 MAX_TOOL_CHARS = 40_000
 
@@ -121,14 +121,15 @@ def _html_to_text(html: str) -> str:
 async def fetch_url(user: dict, url: str) -> ToolResult:
     if papers.parse_arxiv_id(url) and "arxiv.org" in url:
         return await read_arxiv_paper(user, papers.parse_arxiv_id(url))
-    async with httpx.AsyncClient(headers=HTTP_HEADERS, timeout=30, follow_redirects=True) as client:
-        r = await client.get(url)
-        r.raise_for_status()
+    try:
+        r = await net.fetch(url, max_bytes=MAX_PAGE_BYTES, timeout=30)
+    except net.FetchError as e:
+        return ToolResult(str(e), is_error=True)
     ctype = r.headers.get("content-type", "")
     if "pdf" in ctype or r.content.startswith(b"%PDF"):
-        text, _, _ = await asyncio.to_thread(papers.extract_text, r.content)
-    elif "html" in ctype or "<html" in r.text[:2000].lower():
-        text = _html_to_text(r.text)
+        text, _, _ = await papers.extract_text_async(r.content)
+    elif "html" in ctype or "<html" in r.content[:2000].decode("latin-1").lower():
+        text = await asyncio.to_thread(_html_to_text, r.text)
     else:
         text = r.text
     return ToolResult(_clip(text))
@@ -149,7 +150,7 @@ async def read_arxiv_paper(user: dict, arxiv_id: str, offset: int = 0) -> ToolRe
     if not parsed:
         return ToolResult(f"'{arxiv_id}' is not a valid arXiv ID", is_error=True)
     paper = await papers.ingest(user["id"], parsed)  # also stores it, so "open in reader" is instant
-    full = papers.db.get_paper(user["id"], paper["id"], with_text=True)
+    full = await db.aio.get_paper(user["id"], paper["id"], with_text=True)
     header = f"Title: {full['title']}\nAuthors: {', '.join(full['authors'])}\n\n"
     return ToolResult(
         header + _clip(full["text"], int(offset or 0)),

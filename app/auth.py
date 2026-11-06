@@ -98,7 +98,7 @@ def _start_session(response: Response, request: Request, user_id: str):
 
 async def _send_link(request: Request, user: dict, purpose: str):
     token, token_hash = crypto.new_token()
-    db.add_email_token(token_hash, user["id"], purpose, time.time() + LINK_HOURS[purpose] * 3600)
+    await db.aio.add_email_token(token_hash, user["id"], purpose, time.time() + LINK_HOURS[purpose] * 3600)
     # In the URL's fragment, which browsers don't send to the server, and used by the page with a
     # POST: a mail scanner that opens the link doesn't use it up.
     link = f"{base_url(request)}/#{purpose}={token}"
@@ -156,19 +156,19 @@ async def signup(body: SignupIn, request: Request):
     if len(email) > 254 or not _EMAIL.fullmatch(email):
         raise HTTPException(400, "That doesn't look like an email address")
     _check_password(body.password)
-    existing = db.find_user(email=email)
+    existing = await db.aio.find_user(email=email)
     if existing and existing["email_verified"]:
         raise HTTPException(409, "There's already an account with this email. Sign in, or reset its password.")
-    taken = db.find_user(username=username)
-    if taken and (not existing or taken["id"] != existing["id"]):
-        raise HTTPException(409, "That username is taken")
-    password_hash = crypto.hash_password(body.password)
     if existing:
-        # Never verified: whoever signed up with this address before didn't show it's theirs.
-        db.update_user(existing["id"], username=username, password_hash=password_hash)
-        user = db.get_user(existing["id"])
-    else:
-        user = db.create_user(email=email, username=username, password_hash=password_hash)
+        # Signed up before and not confirmed yet. Replacing that password would let whoever signs
+        # up second choose the password of the account the owner then confirms from their inbox.
+        # "Forgot password" sends its link to the address, so only the owner can change it.
+        raise HTTPException(409, "This email already has an account waiting for confirmation. Open the link we"
+                                 " sent it, or use “Forgot password?” to choose a new password.")
+    if await db.aio.find_user(username=username):
+        raise HTTPException(409, "That username is taken")
+    password_hash = await asyncio.to_thread(crypto.hash_password, body.password)
+    user = await db.aio.create_user(email=email, username=username, password_hash=password_hash)
     await _send_link(request, user, "verify")
     return {"ok": True, "email": email}
 
@@ -193,8 +193,9 @@ def login(body: LoginIn, request: Request):
 async def resend(body: LoginIn, request: Request):
     """Sends the verification link again (needs the password, so it can't be used to spam an address)."""
     name = body.login.strip()
-    row = db.find_user(email=name) if "@" in name else db.find_user(username=name)
-    if row and not row["email_verified"] and crypto.check_password(body.password, row["password_hash"]):
+    row = await (db.aio.find_user(email=name) if "@" in name else db.aio.find_user(username=name))
+    if row and not row["email_verified"] and row["password_hash"] and \
+            await asyncio.to_thread(crypto.check_password, body.password, row["password_hash"]):
         await _send_link(request, row, "verify")
     return {"ok": True}
 
@@ -214,7 +215,7 @@ def verify(body: TokenIn, request: Request):
 async def forgot(body: EmailIn, request: Request):
     """Emails a link for choosing a new password (also a way to add one to a Google account). The
     answer is the same whether or not there's an account, so it can't be used to find out."""
-    row = db.find_user(email=body.email.strip()) if body.email.strip() else None
+    row = await db.aio.find_user(email=body.email.strip()) if body.email.strip() else None
     if row:
         await _send_link(request, row, "reset")
     return {"ok": True}
@@ -301,20 +302,20 @@ async def google_callback(request: Request, code: str = "", state: str = "", err
     if not claims.get("email") or not claims.get("email_verified"):
         return _signin_error("Google didn't confirm an email address for this account")
 
-    row = db.find_user(google_sub=claims["sub"])
-    if not row and (row := db.find_user(email=claims["email"])):
+    row = await db.aio.find_user(google_sub=claims["sub"])
+    if not row and (row := await db.aio.find_user(email=claims["email"])):
         # The address signed up with a password before. Google vouches for the address now; a
         # password (and username) chosen by someone who never confirmed it is dropped.
         fields = {"google_sub": claims["sub"], "email_verified": 1, "name": row["name"] or claims.get("name", "")}
         if not row["email_verified"]:
             fields |= {"password_hash": None, "username": None}
-        db.update_user(row["id"], **fields)
+        await db.aio.update_user(row["id"], **fields)
     elif not row:
-        row = db.create_user(email=claims["email"], google_sub=claims["sub"], name=claims.get("name", ""),
-                             email_verified=True)
+        row = await db.aio.create_user(email=claims["email"], google_sub=claims["sub"], name=claims.get("name", ""),
+                                       email_verified=True)
     response = RedirectResponse("/", status_code=303)
     response.delete_cookie(STATE_COOKIE, path="/auth/google")
-    _start_session(response, request, row["id"])
+    await asyncio.to_thread(_start_session, response, request, row["id"])
     return response
 
 
@@ -335,7 +336,7 @@ async def update_account(body: AccountPatch, user: User):
     """Marks the walkthrough seen, and saves or removes the user's API keys. A provider key is
     tried first, so a mistyped one is caught here."""
     if body.tour_done is not None:
-        db.update_user(user["id"], tour_done=int(body.tour_done))
+        await db.aio.update_user(user["id"], tour_done=int(body.tour_done))
     if body.keys is not None:
         stored = crypto.decrypt_keys(user["api_keys"])
         for name, key in body.keys.items():
@@ -352,5 +353,5 @@ async def update_account(body: AccountPatch, user: User):
                     raise HTTPException(400, f"{PROVIDERS[name].label} didn't accept that key: "
                                              f"{str(e)[:200] or type(e).__name__}")
             stored[name] = key
-        db.update_user(user["id"], api_keys=crypto.encrypt_keys(stored))
-    return public(_user(db.get_user(user["id"])))
+        await db.aio.update_user(user["id"], api_keys=crypto.encrypt_keys(stored))
+    return public(_user(await db.aio.get_user(user["id"])))

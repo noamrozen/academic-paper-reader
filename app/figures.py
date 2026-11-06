@@ -25,7 +25,17 @@ def crops_dir(paper: dict):
     return CROPS_DIR / papers.pdf_path(paper).stem
 
 
+_NUMBER = re.compile(r"[A-Z]?\.?\d{1,4}(?:\.\d{1,4}){0,3}", re.I)  # "3", "A2", "A.2", "4.1.2"
+
+
+def valid_number(number: str) -> bool:
+    """A figure or table number as captions print them; anything else (a path, say) is refused."""
+    return bool(_NUMBER.fullmatch(number))
+
+
 def crop_path(paper: dict, kind: str, number: str):
+    if kind not in _KIND_WORDS or not valid_number(number):
+        raise ValueError(f"Not a figure or table: {kind} {number!r}")
     return crops_dir(paper) / f"{kind}-{number}.png"
 
 

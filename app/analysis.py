@@ -13,6 +13,11 @@ is continued from the items it produced; if it stays incomplete, they are kept u
 status and retry() continues from them.
 
 Each user has their own copy of a paper (db.py), analyzed on their own key (auth.user_keys).
+
+A run holds a lease in the database while it works, so a server instance never starts an analysis
+that another instance is running. An instance that stops mid-run (Vercel freezes or ends
+instances) leaves its lease to expire; the next look at the paper's analyses continues the run
+from the items it saved (resume_stalled).
 """
 
 import asyncio
@@ -21,36 +26,60 @@ import json
 import logging
 import re
 import time
+import uuid
 
 from . import db, papers, usage
 from .config import DEFAULT_MODELS
 from .prompts import BIB_PROMPT, CONTINUE_PROMPT, GLOSSARY_PROMPT, REFS_PROMPT, SYSTEM_PROMPT, paper_message_text
-from .providers import StepResult, TextDelta, ThinkingDelta, default_provider
+from .providers import StepResult, TextDelta, ThinkingDelta, default_provider, stream_step
 from .tools import TOOLS
 
 log = logging.getLogger(__name__)
 _tasks: dict[tuple[str, str, str], asyncio.Task] = {}  # by (user id, paper id, analysis)
 TRUNCATED = {"length", "max_tokens", "MAX_TOKENS", "incomplete"}  # each provider's "hit the output limit"
 SAVE_EVERY = 2.0  # seconds between saves of a streaming reply's complete items
+LEASE_TTL = 180.0  # seconds a run's lease lasts unless renewed; how long a stalled run waits to be taken over
+RENEW_EVERY = 30.0
 
 
-def ensure(user: dict, paper_id: str, retry_failed: bool = False):
+def _lease_key(user_id: str, paper_id: str, name: str) -> str:
+    return f"analysis:{user_id}:{paper_id}:{name}"
+
+
+async def ensure(user: dict, paper_id: str, retry_failed: bool = False):
     """Start each missing analysis in the background unless it exists or is already running."""
     if default_provider(user["keys"]) is None:
         return
     for name in JOBS:
         if (user["id"], paper_id, name) in _tasks:
             continue
-        current = db.get_analysis(user["id"], paper_id, name) or {}
+        current = await db.aio.get_analysis(user["id"], paper_id, name) or {}
         status = current.get("status") or ""
         if (status == "ready" and not _outdated(name, current["entries"])) or (status.startswith("failed") and not retry_failed):
             continue
-        # A "pending" left behind by a restart continues from the items it had saved.
-        _start(user, paper_id, name, resume=current["entries"] if resumable(name, current.get("entries")) else None)
+        # A "pending" left behind by a stopped run continues from the items it had saved.
+        await _start(user, paper_id, name, resume=current["entries"] if resumable(name, current.get("entries")) else None)
 
 
-def running(user_id: str, paper_id: str) -> bool:
-    return any(key[:2] == (user_id, paper_id) for key in _tasks)
+async def resume_stalled(user: dict, paper_id: str, analyses: dict[str, dict]):
+    """Continues any "pending" analysis (analyses: as db.get_analysis returns them) that no
+    instance is running any more."""
+    pending = [name for name, a in analyses.items() if a and a.get("status") == "pending"
+               and (user["id"], paper_id, name) not in _tasks]
+    if not pending or default_provider(user["keys"]) is None:
+        return
+    held = await db.aio.active_leases([_lease_key(user["id"], paper_id, n) for n in pending])
+    for name in pending:
+        if _lease_key(user["id"], paper_id, name) not in held:
+            entries = analyses[name].get("entries")
+            await _start(user, paper_id, name, resume=entries if resumable(name, entries) else None)
+
+
+async def running(user_id: str, paper_id: str) -> bool:
+    """Whether any analysis of the paper is running, on this server instance or another."""
+    if any(key[:2] == (user_id, paper_id) for key in _tasks):
+        return True
+    return bool(await db.aio.active_leases([_lease_key(user_id, paper_id, n) for n in JOBS]))
 
 
 def resumable(name: str, entries: dict | None) -> bool:
@@ -59,25 +88,31 @@ def resumable(name: str, entries: dict | None) -> bool:
     return bool(entries) and not _outdated(name, entries)
 
 
-def retry(user: dict, paper_id: str, name: str) -> bool:
+async def retry(user: dict, paper_id: str, name: str) -> bool:
     """Run an analysis again, continuing from the items it kept. False if it's running already."""
     if default_provider(user["keys"]) is None or (user["id"], paper_id, name) in _tasks:
         return False
-    current = db.get_analysis(user["id"], paper_id, name)
+    current = await db.aio.get_analysis(user["id"], paper_id, name)
     if current is None:
         return False
-    _start(user, paper_id, name, resume=current["entries"] if resumable(name, current["entries"]) else None)
-    return True
+    return await _start(user, paper_id, name, resume=current["entries"] if resumable(name, current["entries"]) else None)
 
 
-def _start(user: dict, paper_id: str, name: str, resume: dict | None):
-    # The task first runs at the next await, so marking it pending afterwards is safe, and a
-    # failure to start it leaves the status as it was.
+async def _start(user: dict, paper_id: str, name: str, resume: dict | None) -> bool:
+    """Starts the run unless another one holds its lease. The status becomes "pending" before the
+    run starts; a failure to start leaves the lease to expire and the status as it was."""
     key = (user["id"], paper_id, name)
-    task = asyncio.create_task(_generate(user, paper_id, name, resume or {}))
-    db.set_analysis(user["id"], paper_id, name, "pending")
+    holder = uuid.uuid4().hex
+    if key in _tasks or not await db.aio.acquire_lease(_lease_key(*key), holder, LEASE_TTL):
+        return False
+    if key in _tasks:  # started here while the lease was being taken
+        await db.aio.release_lease(_lease_key(*key), holder)
+        return False
+    await db.aio.set_analysis(user["id"], paper_id, name, "pending")
+    task = asyncio.create_task(_generate(user, paper_id, name, resume or {}, holder))
     _tasks[key] = task
     task.add_done_callback(lambda _, key=key: _tasks.pop(key, None))
+    return True
 
 
 def _outdated(name: str, entries: dict) -> bool:
@@ -86,16 +121,36 @@ def _outdated(name: str, entries: dict) -> bool:
     return name == "refs" and any(e["kind"] in PROVABLE and "proof" not in e for e in entries.values())
 
 
-async def _generate(user: dict, paper_id: str, name: str, base: dict):
-    """base: items kept from an earlier, cut-off run, which the model is asked to continue."""
+async def _generate(user: dict, paper_id: str, name: str, base: dict, holder: str):
+    """base: items kept from an earlier, cut-off run, which the model is asked to continue.
+    holder: this run's lease (see _start), renewed while it runs and released at the end."""
+    lease = _lease_key(user["id"], paper_id, name)
+    last_renew = time.monotonic()
+
+    async def renew():
+        nonlocal last_renew
+        if time.monotonic() - last_renew >= RENEW_EVERY:
+            last_renew = time.monotonic()
+            await db.aio.acquire_lease(lease, holder, LEASE_TTL)
+
+    try:
+        await _run(user, paper_id, name, base, renew)
+    finally:
+        try:
+            await db.aio.release_lease(lease, holder)
+        except Exception:
+            log.warning("Could not release %s", lease, exc_info=True)
+
+
+async def _run(user: dict, paper_id: str, name: str, base: dict, renew):
     prompt, parse = JOBS[name]
     user_id = user["id"]
     provider = default_provider(user["keys"])
     model = DEFAULT_MODELS[provider.id]
-    paper = db.get_paper(user_id, paper_id, with_text=True)
+    paper = await db.aio.get_paper(user_id, paper_id, with_text=True)
     paper_text = paper_message_text(paper)
     # Starting over (an outdated index): the old entries stay usable until new ones replace them.
-    keep = {} if base else (db.get_analysis(user_id, paper_id, name) or {}).get("entries") or {}
+    keep = {} if base else ((await db.aio.get_analysis(user_id, paper_id, name)) or {}).get("entries") or {}
     try:
         for attempt in range(3):
             # Same system prompt, tools and paper block as a conversation, so this call also warms
@@ -104,9 +159,9 @@ async def _generate(user: dict, paper_id: str, name: str, base: dict):
                 {"type": "paper"}, {"type": "text", "text": prompt + _continuation(name, base)}]}]
             chunks, saved, last_save, result, thinking = [], 0, time.monotonic(), None, 0
             # No reasoning: it's billed as output and listing items from the paper doesn't need it.
-            async for ev in provider.stream_step(model=model, system=SYSTEM_PROMPT, paper_text=paper_text,
-                                                 paper_id=paper_id, messages=messages, tools=TOOLS,
-                                                 reasoning=False):
+            async for ev in stream_step(provider, model=model, system=SYSTEM_PROMPT, paper_text=paper_text,
+                                        paper_id=paper_id, messages=messages, tools=TOOLS, reasoning=False):
+                await renew()
                 if isinstance(ev, TextDelta):
                     chunks.append(ev.text)
                     if time.monotonic() - last_save >= SAVE_EVERY:
@@ -114,7 +169,7 @@ async def _generate(user: dict, paper_id: str, name: str, base: dict):
                         partial = parse("".join(chunks), paper["text"])
                         if len(partial) > saved:
                             saved = len(partial)
-                            _save(user_id, paper_id, name, "pending", {**keep, **_merge(name, base, partial)})
+                            await _save(user_id, paper_id, name, "pending", {**keep, **_merge(name, base, partial)})
                 elif isinstance(ev, ThinkingDelta):
                     thinking += len(ev.text)
                 elif isinstance(ev, StepResult):
@@ -128,25 +183,25 @@ async def _generate(user: dict, paper_id: str, name: str, base: dict):
                 entries = dict(base)
             if entries and not truncated:
                 entries = _merge(name, base, entries)
-                _save(user_id, paper_id, name, "ready", entries)
+                await _save(user_id, paper_id, name, "ready", entries)
                 log.info("%s for %s: %d entries (%s %s)", name, paper_id, len(entries), provider.id, model)
                 return
             if entries:  # cut off: continue after the items it produced
                 base = _merge(name, base, entries)
-                _save(user_id, paper_id, name, "pending", {**keep, **base})
+                await _save(user_id, paper_id, name, "pending", {**keep, **base})
                 log.warning("%s for %s: cut off at the output limit with %d items (attempt %d; %s)",
                             name, paper_id, len(base), attempt + 1, sizes)
             else:
                 log.warning("%s for %s: unparseable reply (attempt %d, stop=%s; %s)",
                             name, paper_id, attempt + 1, result.stop_reason, sizes)
         if base:  # (replacing any outdated entries, so that a retry continues from these)
-            _save(user_id, paper_id, name, f"failed: the reply was still cut off at the output limit ({len(base)} items kept)", base)
+            await _save(user_id, paper_id, name, f"failed: the reply was still cut off at the output limit ({len(base)} items kept)", base)
         else:
-            db.set_analysis(user_id, paper_id, name, "failed: the model did not return valid JSON")
+            await db.aio.set_analysis(user_id, paper_id, name, "failed: the model did not return valid JSON")
     except Exception as e:
         log.exception("%s for %s failed", name, paper_id)
         # Whatever streamed before the error was saved as it arrived, so it's kept for a retry.
-        db.set_analysis(user_id, paper_id, name, f"failed: {type(e).__name__}: {e}"[:500])
+        await db.aio.set_analysis(user_id, paper_id, name, f"failed: {type(e).__name__}: {e}"[:500])
 
 
 def _merge(name: str, base: dict, new: dict) -> dict:
@@ -176,15 +231,15 @@ def _continuation(name: str, base: dict) -> str:
                                   shape="object" if name == "glossary" else "array")
 
 
-def _save(user_id: str, paper_id: str, name: str, status: str, entries: dict):
+async def _save(user_id: str, paper_id: str, name: str, status: str, entries: dict):
     """Saves entries, keeping the arXiv lookups resolve_bib already made for bibliography entries."""
     if name == "bib":
-        current = (db.get_analysis(user_id, paper_id, "bib") or {}).get("entries") or {}
+        current = ((await db.aio.get_analysis(user_id, paper_id, "bib")) or {}).get("entries") or {}
         for k, e in entries.items():
             c = current.get(k)
             if c and c.get("lookup") and not e.get("lookup") and c["title"] == e["title"]:
                 e["arxiv_id"], e["lookup"] = c["arxiv_id"], c["lookup"]
-    db.set_analysis(user_id, paper_id, name, status, entries)
+    await db.aio.set_analysis(user_id, paper_id, name, status, entries)
 
 
 def _empty_json(text: str) -> bool:
@@ -361,14 +416,15 @@ async def resolve_bib(user_id: str, paper_id: str, ids: list[str]) -> dict[str, 
     """Find arXiv IDs for the given bibliography entries by title search, caching the outcome
     (an ID, or "none") in the paper's bib so each entry is searched at most once."""
     async with _bib_locks.setdefault((user_id, paper_id), asyncio.Lock()):
-        bib = (db.get_analysis(user_id, paper_id, "bib") or {}).get("entries") or {}
+        bib = ((await db.aio.get_analysis(user_id, paper_id, "bib")) or {}).get("entries") or {}
         found = {}
         for i in ids:
             e = bib.get(i)
             if not e or e.get("lookup"):
                 continue
             try:
-                results = await papers.search_arxiv(e["title"], max_results=5)
+                # A paper already looked up (by anyone) with this exact title needs no request to arXiv.
+                results = await papers.find_by_title(e["title"]) or await papers.search_arxiv(e["title"], max_results=5)
             except Exception:
                 log.warning("arXiv lookup failed for %s entry %s", paper_id, i, exc_info=True)
                 continue  # leave unresolved; a later selection retries
@@ -383,11 +439,11 @@ async def resolve_bib(user_id: str, paper_id: str, ids: list[str]) -> dict[str, 
             found[i] = (e["title"], *((best[1]["arxiv_id"], "arxiv") if best else (None, "none")))
         # The bibliography may still be streaming in: apply the lookups to the current entries and
         # keep its status.
-        current = db.get_analysis(user_id, paper_id, "bib") or {}
+        current = await db.aio.get_analysis(user_id, paper_id, "bib") or {}
         bib = current.get("entries") or {}
         for i, (title, arxiv_id, lookup) in found.items():
             if i in bib and bib[i]["title"] == title:
                 bib[i]["arxiv_id"], bib[i]["lookup"] = arxiv_id, lookup
         if found:
-            db.set_analysis(user_id, paper_id, "bib", current["status"], bib)
+            await db.aio.set_analysis(user_id, paper_id, "bib", current["status"], bib)
         return {i: bib[i] for i in ids if i in bib}

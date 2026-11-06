@@ -3,7 +3,7 @@ import json
 import openai
 
 from ..config import OPENROUTER_MAX_TOKENS
-from .base import Provider, StepResult, TextDelta, ThinkingDelta, raw_for, tool_result_text
+from .base import Provider, ProviderError, StepResult, TextDelta, ThinkingDelta, raw_for, tool_result_text
 
 BASE_URL = "https://openrouter.ai/api/v1"
 
@@ -78,7 +78,9 @@ class OpenRouterProvider(Provider):
             extra = chunk.model_extra or {}
             if extra.get("error"):
                 err = extra["error"]
-                raise RuntimeError(f"OpenRouter error: {err.get('message', err) if isinstance(err, dict) else err}")
+                code = err.get("code") if isinstance(err, dict) else None
+                raise ProviderError(f"OpenRouter error: {err.get('message', err) if isinstance(err, dict) else err}",
+                                    code if isinstance(code, int) else None)
             if chunk.usage:
                 usage = chunk.usage
             if not chunk.choices:

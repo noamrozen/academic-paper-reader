@@ -11,10 +11,15 @@ from urllib.parse import urlparse
 import httpx
 import pymupdf
 
-from . import db
-from .config import HTTP_HEADERS, PAPERS_DIR
+from . import db, net
+from .config import (ARXIV_API_INTERVAL, ARXIV_PDF_INTERVAL, HTTP_HEADERS, MAX_PDF_BYTES, MAX_PDF_PAGES, PAPERS_DIR,
+                     PARSE_SECONDS)
 
 ARXIV_API = "https://export.arxiv.org/api/query"
+# arXiv's host for programmatic access: the server downloads PDFs from here, browsers from arxiv.org.
+ARXIV_EXPORT = "https://export.arxiv.org"
+ARXIV_MAX_WAIT = 60  # seconds a request waits for its turn at arXiv before giving up
+META_TTL = 12 * 3600  # how old cached arXiv metadata may be where the latest version matters
 OPENALEX_API = "https://api.openalex.org/works"
 ATOM = {"a": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
 
@@ -78,7 +83,7 @@ async def ensure_pdf(paper: dict):
         pdf = await download_pdf(pdf_url(paper))
         if paper.get("pdf_sha256") and hashlib.sha256(pdf).hexdigest() != paper["pdf_sha256"]:
             raise PaperError(f"The PDF at {pdf_url(paper)} has changed since this paper was added")
-        path.write_bytes(pdf)
+        await asyncio.to_thread(path.write_bytes, pdf)
     return path
 
 
@@ -100,15 +105,45 @@ async def newer_version(paper: dict) -> int | None:
         latest = meta and meta["version"]
         if not latest:
             return None
-        db.set_latest_version(paper["id"], latest)
+        await db.aio.set_latest_version(paper["id"], latest)
     return latest if latest > paper["arxiv_version"] else None
 
 
+async def arxiv_turn(key: str = "arxiv-api", interval: float = ARXIV_API_INTERVAL):
+    """Waits for this request's turn at arXiv: one request per interval across every server
+    instance (the pacing is kept in the database)."""
+    start = await db.aio.reserve_slot(key, interval)
+    wait = start - time.time()
+    if wait > ARXIV_MAX_WAIT:
+        raise PaperError("arXiv is busy right now; try again in a minute")
+    if wait > 0:
+        await asyncio.sleep(wait)
+
+
+def title_key(title: str) -> str:
+    return " ".join(title_words(title))
+
+
 async def arxiv_query(params: dict) -> list[dict]:
+    """A call to arXiv's API, paced (arxiv_turn). Every paper it returns is remembered in arxiv_meta."""
     async with httpx.AsyncClient(headers=HTTP_HEADERS, timeout=30, follow_redirects=True) as client:
-        r = await client.get(ARXIV_API, params=params)
+        for attempt in range(2):
+            await arxiv_turn()
+            r = await client.get(ARXIV_API, params=params)
+            if r.status_code not in (429, 503) or attempt:
+                break
+            # Asked to slow down: wait as told (within reason), then take another turn.
+            retry_after = r.headers.get("retry-after", "")
+            await asyncio.sleep(min(float(retry_after), 20) if retry_after.isdigit() else 5)
         r.raise_for_status()
-    root = ET.fromstring(r.text)
+    out = _parse_atom(r.text)
+    if out:
+        await db.aio.put_arxiv_meta([{**m, "title_key": title_key(m["title"])} for m in out])
+    return out
+
+
+def _parse_atom(xml: str) -> list[dict]:
+    root = ET.fromstring(xml)
     out = []
     for entry in root.findall("a:entry", ATOM):
         id_url = entry.findtext("a:id", "", ATOM)
@@ -129,14 +164,35 @@ async def arxiv_query(params: dict) -> list[dict]:
     return out
 
 
-async def arxiv_metadata(arxiv_id: str) -> dict | None:
-    results = await arxiv_query({"id_list": arxiv_id, "max_results": 1})
-    return results[0] if results else None
+def _meta_result(row: dict) -> dict:
+    """An arxiv_meta row in arxiv_query's result shape."""
+    return {k: row[k] for k in ("arxiv_id", "version", "title", "authors", "abstract", "published", "updated")} | {
+        "url": f"https://arxiv.org/abs/{row['arxiv_id']}"}
+
+
+async def arxiv_metadata_many(arxiv_ids: list[str], max_age: float | None = None) -> dict[str, dict]:
+    """arXiv's metadata for these IDs: from arxiv_meta when it's there (and, with max_age, no older
+    than that), the rest from arXiv in one request. IDs arXiv doesn't know are left out."""
+    ids = list(dict.fromkeys(arxiv_ids))
+    cached = await db.aio.get_arxiv_meta(ids)
+    found = {i: _meta_result(m) for i, m in cached.items()
+             if max_age is None or time.time() - m["fetched_at"] < max_age}
+    missing = [i for i in ids if i not in found]
+    for start in range(0, len(missing), 50):
+        batch = missing[start:start + 50]
+        for r in await arxiv_query({"id_list": ",".join(batch), "max_results": len(batch)}):
+            found[r["arxiv_id"]] = r
+    return found
+
+
+async def arxiv_metadata(arxiv_id: str, max_age: float | None = META_TTL) -> dict | None:
+    return (await arxiv_metadata_many([arxiv_id], max_age)).get(arxiv_id)
 
 
 async def search_arxiv(query: str, max_results: int = 5) -> list[dict]:
-    if parse_arxiv_id(query):
-        return await arxiv_query({"id_list": parse_arxiv_id(query), "max_results": 1})
+    if arxiv_id := parse_arxiv_id(query):
+        meta = await arxiv_metadata(arxiv_id, max_age=None)
+        return [meta] if meta else []
     # Quote the query as a title phrase first; fall back to an all-fields search.
     phrase = query.replace('"', "")
     results = await arxiv_query(
@@ -161,6 +217,11 @@ def title_match(a: str, b: str) -> float:
 
 
 _ARXIV_DOI = re.compile(rf"10\.48550/arxiv\.({_NEW_ID}|{_OLD_ID})", re.IGNORECASE)
+
+
+async def find_by_title(title: str) -> list[dict]:
+    """Papers already looked up whose title has the same words as this one (no request to arXiv)."""
+    return [_meta_result(m) for m in await db.aio.find_arxiv_meta(title_key(title))]
 
 
 async def _openalex_search(query: str, max_results: int) -> list[dict]:
@@ -196,17 +257,17 @@ async def _openalex_search(query: str, max_results: int) -> list[dict]:
     return out
 
 
-async def _first_pdf(client: httpx.AsyncClient, urls: list[str]) -> str | None:
+async def _first_pdf(urls: list[str]) -> str | None:
     """The first URL that really serves a PDF; many "PDF" links are paywalls or HTML landing pages."""
     for url in urls[:3]:
         try:
-            async with client.stream("GET", url) as r:
+            async with net.open_url(url, timeout=8) as r:
                 if r.status_code == 200:
                     async for chunk in r.aiter_bytes():
                         if chunk.startswith(b"%PDF"):
                             return url
                         break
-        except httpx.HTTPError:
+        except (httpx.HTTPError, net.FetchError):
             pass
     return None
 
@@ -243,9 +304,8 @@ async def search_papers(query: str, max_results: int = 8) -> list[dict]:
     merged = merged[:max_results]
 
     no_arxiv = [r for r in merged if not r["arxiv_id"] and r["pdf_urls"]]
-    async with httpx.AsyncClient(headers=HTTP_HEADERS, timeout=8, follow_redirects=True) as client:
-        found = await asyncio.gather(*(asyncio.wait_for(_first_pdf(client, r["pdf_urls"]), 12) for r in no_arxiv),
-                                     return_exceptions=True)
+    found = await asyncio.gather(*(asyncio.wait_for(_first_pdf(r["pdf_urls"]), 12) for r in no_arxiv),
+                                 return_exceptions=True)
     pdfs = {id(r): f for r, f in zip(no_arxiv, found) if isinstance(f, str)}
     for r in merged:
         r["open"] = r["arxiv_id"] or pdfs.get(id(r))
@@ -256,6 +316,8 @@ async def search_papers(query: str, max_results: int = 8) -> list[dict]:
 def extract_text(pdf_bytes: bytes) -> tuple[str, int, dict]:
     """Extract text page by page with explicit page markers so the model can cite pages."""
     with pymupdf.open(stream=pdf_bytes, filetype="pdf") as doc:
+        if doc.page_count > MAX_PDF_PAGES:
+            raise PaperError(f"This PDF has {doc.page_count} pages; the limit is {MAX_PDF_PAGES}")
         pages = []
         for i, page in enumerate(doc, start=1):
             text = page.get_text("text").replace("\x00", "").strip()  # NULs: extraction noise, and libsql cuts strings at one
@@ -265,10 +327,29 @@ def extract_text(pdf_bytes: bytes) -> tuple[str, int, dict]:
         return "\n\n".join(pages), doc.page_count, doc.metadata or {}
 
 
+async def extract_text_async(pdf_bytes: bytes) -> tuple[str, int, dict]:
+    """extract_text in a worker thread, given up on after PARSE_SECONDS (a PDF built to be slow to
+    parse ties up that thread until it's done, but not the request)."""
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(extract_text, pdf_bytes), PARSE_SECONDS)
+    except TimeoutError:
+        raise PaperError(f"Reading this PDF took longer than {PARSE_SECONDS:.0f} s") from None
+    except PaperError:
+        raise
+    except Exception as e:
+        raise PaperError(f"Could not read this PDF: {e}") from None
+
+
 async def download_pdf(url: str) -> bytes:
-    async with httpx.AsyncClient(headers=HTTP_HEADERS, timeout=120, follow_redirects=True) as client:
-        r = await client.get(url)
-        r.raise_for_status()
+    """The PDF at url (checked: a public address, at most MAX_PDF_BYTES). arXiv PDFs come from its
+    export host, at a paced rate."""
+    if url.startswith("https://arxiv.org/pdf/"):
+        url = ARXIV_EXPORT + url.removeprefix("https://arxiv.org")
+        await arxiv_turn("arxiv-pdf", ARXIV_PDF_INTERVAL)
+    try:
+        r = await net.fetch(url, max_bytes=MAX_PDF_BYTES, timeout=90)
+    except net.FetchError as e:
+        raise PaperError(str(e)) from None
     if not r.content.startswith(b"%PDF"):
         raise PaperError(f"{url} did not return a PDF")
     return r.content
@@ -283,33 +364,33 @@ async def ingest(user_id: str, source: str, known: dict | None = None) -> dict:
     The stored text is frozen at ingest time, so the paper message sent to the model is
     byte-identical across every conversation about this paper (keeps the prefix cache warm).
     """
-    if stored := db.get_paper(user_id, source.strip()):  # by its id, e.g. an archived version ("2210.02747v2")
+    if stored := await db.aio.get_paper(user_id, source.strip()):  # by its id, e.g. an archived version ("2210.02747v2")
         return stored
     paper_id, arxiv_id = paper_id_for(source)
     async with _locks[user_id, paper_id]:
-        existing = db.get_paper(user_id, paper_id)
+        existing = await db.aio.get_paper(user_id, paper_id)
         if existing:
             return existing
         paper, pdf_bytes = await _fetch(source, paper_id, arxiv_id, known)
         if pdf_bytes:
-            pdf_path(paper).write_bytes(pdf_bytes)
-        db.insert_paper(user_id, paper)
-        return db.get_paper(user_id, paper_id)
+            await asyncio.to_thread(pdf_path(paper).write_bytes, pdf_bytes)
+        await db.aio.insert_paper(user_id, paper)
+        return await db.aio.get_paper(user_id, paper_id)
 
 
 async def _fetch(source: str, paper_id: str, arxiv_id: str | None,
-                 known: dict | None = None) -> tuple[dict, bytes | None]:
+                 known: dict | None = None, fresh: bool = False) -> tuple[dict, bytes | None]:
     """The paper to store (not stored yet), and its PDF. For arXiv, the latest version, pinned:
     pdf_url names that version, so the same file can be downloaded again. When another user already
     has that version, the paper is a copy of theirs, with its finished analyses, and the PDF None."""
     if arxiv_id:
-        meta = await arxiv_metadata(arxiv_id)
+        meta = await arxiv_metadata(arxiv_id, max_age=0 if fresh else META_TTL)
         if meta is None:
             raise PaperError(f"arXiv paper {arxiv_id} not found")
         version = meta["version"]
         pdf_url = f"https://arxiv.org/pdf/{arxiv_id}" + (f"v{version}" if version else "")
         source_url = meta["url"]
-        if version and (copy := db.pinned_copy(pdf_url)):
+        if version and (copy := await db.aio.pinned_copy(pdf_url)):
             return {**copy, "id": paper_id, "folder_id": None}, None
     else:
         parsed = urlparse(source.strip())
@@ -318,7 +399,7 @@ async def _fetch(source: str, paper_id: str, arxiv_id: str | None,
         meta, version, pdf_url, source_url = None, None, source.strip(), source.strip()
 
     pdf_bytes = await download_pdf(pdf_url)
-    text, num_pages, pdf_meta = await asyncio.to_thread(extract_text, pdf_bytes)
+    text, num_pages, pdf_meta = await extract_text_async(pdf_bytes)
 
     if meta is None and known and known.get("title"):
         meta = {"title": known["title"][:300], "authors": known.get("authors") or [],
@@ -347,17 +428,18 @@ async def update_to_latest(user_id: str, paper_id: str) -> dict:
     folder. The new version is downloaded first, so a failure leaves everything as it was.
     (The PDF files stay where they are: they're named by their hash.)"""
     async with _locks[user_id, paper_id]:
-        paper = db.get_paper(user_id, paper_id)
+        paper = await db.aio.get_paper(user_id, paper_id)
         if not paper or not paper.get("arxiv_version") or archived(paper_id):
             raise PaperError("Only the current version of an arXiv paper can be updated")
-        new, pdf_bytes = await _fetch(paper_id, paper_id, paper_id)
+        new, pdf_bytes = await _fetch(paper_id, paper_id, paper_id, fresh=True)
         if new["arxiv_version"] <= paper["arxiv_version"]:
             raise PaperError(f"v{paper['arxiv_version']} is already the latest version")
         archived_id = f"{paper_id}v{paper['arxiv_version']}"
-        if db.get_paper(user_id, archived_id):
+        if await db.aio.get_paper(user_id, archived_id):
             raise PaperError(f"{archived_id} is already in the library")
-        db.archive_and_replace(user_id, paper_id, archived_id, db.top_folder(user_id, ARCHIVE_FOLDER), new)
+        archive = await db.aio.top_folder(user_id, ARCHIVE_FOLDER)
+        await db.aio.archive_and_replace(user_id, paper_id, archived_id, archive, new)
         if pdf_bytes:
-            pdf_path(new).write_bytes(pdf_bytes)
-        db.set_latest_version(paper_id, new["arxiv_version"])
-        return db.get_paper(user_id, paper_id)
+            await asyncio.to_thread(pdf_path(new).write_bytes, pdf_bytes)
+        await db.aio.set_latest_version(paper_id, new["arxiv_version"])
+        return await db.aio.get_paper(user_id, paper_id)

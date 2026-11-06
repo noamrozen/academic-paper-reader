@@ -106,7 +106,7 @@ async def record(user_id: str, provider: str, model: str, u: dict, *, kind: str,
         cost = u.get("cost")  # billed by the provider (OpenRouter)
         if cost is None:
             cost = await price(provider, model, u)
-        db.add_usage({
+        await db.aio.add_usage({
             "created_at": time.time(), "provider": provider, "model": model, "kind": kind,
             "paper_id": paper_id, "conversation_id": conversation_id, "input": u.get("input", 0),
             "cached_input": u.get("cached_input", 0), "cache_write": u.get("cache_write", 0),
@@ -117,7 +117,7 @@ async def record(user_id: str, provider: str, model: str, u: dict, *, kind: str,
 
 
 async def _price_missing():
-    rows = db.list_usage(None, unpriced_only=True)
+    rows = await db.aio.list_usage(None, unpriced_only=True)
     if not rows:
         return
     costs = {}
@@ -125,7 +125,7 @@ async def _price_missing():
         c = await price(r["provider"], r["model"], r)
         if c is not None:
             costs[r["id"]] = c
-    db.set_usage_costs(costs)
+    await db.aio.set_usage_costs(costs)
 
 
 def _period_start(d: date, period: str) -> date:
@@ -186,10 +186,10 @@ async def summary(user: dict, tz_name: str | None) -> dict:
             s.append(_previous(s[-1], period))
         starts[period] = s
     since = min(s[-1] for s in starts.values())
-    rows = db.list_usage(user["id"], since=datetime.combine(since, datetime.min.time(), tz).timestamp())
+    rows = await db.aio.list_usage(user["id"], since=datetime.combine(since, datetime.min.time(), tz).timestamp())
     budgets = BUDGETS if user["is_admin"] else {}
 
-    out = {"currency": "USD", "total": db.usage_total(user["id"]), "periods": {},
+    out = {"currency": "USD", "total": await db.aio.usage_total(user["id"]), "periods": {},
            "provider_budgets": await _openrouter_budgets(user["keys"].get("openrouter"))}
     for period, period_starts in starts.items():
         current = period_starts[0]

@@ -27,6 +27,10 @@ const el = (tag, attrs = {}, ...children) => {
   return node;
 };
 
+// A link from outside the app (a model's answer, a search result) only if it's http(s): never
+// "javascript:" or other schemes that run code when clicked.
+const safeUrl = (url) => (typeof url === "string" && /^https?:\/\//i.test(url.trim()) ? url.trim() : null);
+
 // A trash-can glyph that takes the text color, for delete buttons.
 const trashIcon = () => {
   const t = document.createElement("template");
@@ -758,7 +762,7 @@ function renderCitations(ids) {
       status.append("Not found on arXiv · ",
         el("a", { href: `https://scholar.google.com/scholar?q=${encodeURIComponent(e.title)}`, target: "_blank", rel: "noopener" },
           "Search Google Scholar ↗"));
-      if (e.url) status.append(" · ", el("a", { href: e.url, target: "_blank", rel: "noopener" }, "Link ↗"));
+      if (safeUrl(e.url)) status.append(" · ", el("a", { href: safeUrl(e.url), target: "_blank", rel: "noopener" }, "Link ↗"));
     }
     box.append(el("div", { class: "cite-entry" },
       e.number ? el("span", { class: "cite-num" }, `[${e.number}]`) : null,
@@ -906,8 +910,8 @@ function searchResult(r) {
   const badge = r.arxiv_id ? el("span", { class: "badge" }, `arXiv ${r.arxiv_id}`)
     : r.open ? el("span", { class: "badge", title: "Not on arXiv; opens the PDF" }, "PDF")
     : el("span", { class: "badge unsupported", title: "No arXiv version or downloadable PDF found" }, "unsupported");
-  const external = r.url && el("a", {
-    class: "ext", href: r.url, target: "_blank", rel: "noopener", title: "Open the paper's page in a new tab",
+  const external = safeUrl(r.url) && el("a", {
+    class: "ext", href: safeUrl(r.url), target: "_blank", rel: "noopener", title: "Open the paper's page in a new tab",
     onclick: (e) => e.stopPropagation(),
   }, "↗");
   const row = el("div", { class: "search-result" + (r.open ? " openable" : "") },
@@ -2064,6 +2068,15 @@ function providerLabel(id) {
 
 // ---------------------------------------------------------------- Markdown + math
 
+// Images in rendered markdown load only from this app (or are inline data): an image from anywhere
+// else would send a request, with whatever a prompt injection put in its URL, to that server.
+DOMPurify.addHook("afterSanitizeAttributes", (node) => {
+  if (node.tagName === "IMG") {
+    const src = node.getAttribute("src") || "";
+    if (!/^(\/(?!\/)|data:image\/|blob:)/i.test(src)) node.remove();
+  }
+});
+
 function renderMarkdown(src) {
   const stash = [];
   const hold = (html) => `\uE000${stash.push(html) - 1}\uE000`;
@@ -2088,7 +2101,8 @@ function renderMarkdown(src) {
       return katex.renderToString(item.math, { displayMode: item.display, throwOnError: false });
     } catch { return m; }
   });
-  return html;
+  // Again with the math in: KaTeX's output is meant to be safe, but this is the HTML that goes on the page.
+  return DOMPurify.sanitize(html);
 }
 
 const ARXIV_LINK = /arxiv\.org\/(?:abs|pdf|html)\/(\d{4}\.\d{4,5}(?:v\d+)?|[a-z\-]+(?:\.[A-Z]{2})?\/\d{7}(?:v\d+)?)/i;
@@ -2654,7 +2668,7 @@ async function sendQuestion(question, selection) {
   box.append(view.root);
   box.scrollTop = box.scrollHeight;
 
-  const body = {
+  let body = {
     conversation_id: state.conv?.id || null,
     paper_id: state.paper?.id || null, // none: a search session
     provider: $("provider").value,
@@ -2664,26 +2678,34 @@ async function sendQuestion(question, selection) {
   };
 
   try {
-    const res = await fetch("/api/chat", {
-      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
-      signal: state.abort.signal, // Stop closes the stream; the server keeps what was said so far
-    });
-    if (!res.ok) throw new Error(await errorMessage(res));
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = "";
+    // A long answer pauses between steps (the server's requests have a time limit); everything
+    // so far is saved, and the next request continues it.
     for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      let idx;
-      while ((idx = buf.indexOf("\n\n")) >= 0) {
-        const line = buf.slice(0, idx).trim();
-        buf = buf.slice(idx + 2);
-        if (line.startsWith("data: ")) handleEvent(JSON.parse(line.slice(6)), view);
+      const status = { paused: false };
+      const res = await fetch("/api/chat", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+        signal: state.abort.signal, // Stop closes the stream; the server keeps what was said so far
+      });
+      if (!res.ok) throw new Error(await errorMessage(res));
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let idx;
+        while ((idx = buf.indexOf("\n\n")) >= 0) {
+          const line = buf.slice(0, idx).trim();
+          buf = buf.slice(idx + 2);
+          if (line.startsWith("data: ")) handleEvent(JSON.parse(line.slice(6)), view, status);
+        }
+        const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 120;
+        if (nearBottom) box.scrollTop = box.scrollHeight;
       }
-      const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 120;
-      if (nearBottom) box.scrollTop = box.scrollHeight;
+      if (!status.paused || !state.conv) break;
+      view.newText();
+      body = { conversation_id: state.conv.id, provider: body.provider, model: body.model, resume: true };
     }
   } catch (e) {
     if (e.name === "AbortError") view.stopped();
@@ -2697,7 +2719,7 @@ async function sendQuestion(question, selection) {
   }
 }
 
-function handleEvent(ev, view) {
+function handleEvent(ev, view, status = {}) {
   switch (ev.type) {
     case "conversation": {
       const isNew = !state.conv;
@@ -2714,6 +2736,7 @@ function handleEvent(ev, view) {
     case "tool_result": view.toolResult(ev); break;
     case "usage": view.usage(ev.usage, $("model").value.trim(), ev.stop_reason); loadUsage(); break;
     case "step": view.newText(); break;
+    case "paused": status.paused = true; break;
     case "error": view.error(ev.message); break;
   }
 }

@@ -89,8 +89,22 @@ BUDGETS = {period: float(v) for period, v in (
 
 # Maximum number of model calls (tool-use rounds) per user turn.
 MAX_AGENT_STEPS = int(os.environ.get("MAX_AGENT_STEPS", "12"))
+# No new step starts after this many seconds of a turn: the answer pauses, and the browser asks for
+# the rest in a new request. Vercel ends a request at 300 s (Hobby), and one step can take a minute.
+AGENT_TURN_SECONDS = float(os.environ.get("AGENT_TURN_SECONDS", "180"))
 
-HTTP_HEADERS = {"User-Agent": "academic-paper-reader/0.1 (+https://github.com/)"}
+# Limits on what the server downloads (a PDF, or a page the agent fetches) and parses.
+MAX_PDF_BYTES = int(os.environ.get("MAX_PDF_BYTES", str(60 * 1024 * 1024)))
+MAX_PAGE_BYTES = int(os.environ.get("MAX_PAGE_BYTES", str(10 * 1024 * 1024)))
+MAX_PDF_PAGES = int(os.environ.get("MAX_PDF_PAGES", "400"))
+PARSE_SECONDS = float(os.environ.get("PARSE_SECONDS", "60"))
+
+# arXiv asks automated clients to name themselves with a way to reach their maintainer, and to send
+# its API at most one request every 3 seconds, on one connection (papers.arxiv_query).
+CONTACT_URL = os.environ.get("CONTACT_URL", "https://github.com/noamrozen/academic-paper-reader")
+HTTP_HEADERS = {"User-Agent": f"academic-paper-reader/0.1 (+{CONTACT_URL})"}
+ARXIV_API_INTERVAL = float(os.environ.get("ARXIV_API_INTERVAL", "3"))
+ARXIV_PDF_INTERVAL = float(os.environ.get("ARXIV_PDF_INTERVAL", "1"))
 
 PAPERS_DIR.mkdir(parents=True, exist_ok=True)
 
