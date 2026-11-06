@@ -5,17 +5,18 @@ USE_TURSO in config.py). A one-off, for moving to Vercel: see "Deploying to Verc
 It works on a copy, so data/app.db is left as it was. The copy is
 - brought to the app's current schema (db.init);
 - cleaned of NUL characters in paper text (libsql cuts strings at them);
-- disowned: accounts aren't copied (their ids, passwords and sessions belong to each database), so
-  the library goes up without an owner, and the first admin to sign in to the app on Turso gets it;
+- given an owner: accounts aren't copied (their ids, passwords and sessions belong to each database),
+  so the library goes to the account with the --owner email, which must have signed in to the app on
+  that database already; without --owner it goes up without one, and the first admin to sign in gets it;
 - pinned: papers added before the app recorded their PDF get its URL (for arXiv, with the version)
   and the SHA-256 of the file saved in data/papers. An arXiv version that came out before the paper
   was added is the one it was read from; any other is downloaded to check it's that file.
 Then its rows go to Turso in one transaction, and the two databases' row counts are compared.
 
-    uv run python scripts/migrate_to_turso.py [--replace]
+    uv run python scripts/migrate_to_turso.py [--owner EMAIL] [--replace]
 
---replace first deletes what the Turso database holds; without it, one that isn't empty is left
-alone.
+--replace first deletes what the Turso database holds (every account's library, though not the
+accounts); without it, one that isn't empty is left alone.
 """
 
 import argparse
@@ -52,14 +53,18 @@ def drop_nuls(copy: sqlite3.Connection):
     print(f"Dropped NUL characters from the text of {len(fixed)} papers")
 
 
-def disown(copy: sqlite3.Connection):
+def check_one_owner(copy: sqlite3.Connection):
     owners = {r[0] for t in OWNED for r in copy.execute(f"SELECT DISTINCT user_id FROM {t}")} - {""}
     if len(owners) > 1:
         sys.exit(f"The local database holds the libraries of {len(owners)} accounts; this copies one person's.")
+
+
+def give_to(copy: sqlite3.Connection, owner: dict | None):
     for table in OWNED:
-        copy.execute(f"UPDATE {table} SET user_id = ''")
+        copy.execute(f"UPDATE {table} SET user_id = ?", (owner["id"] if owner else "",))
     copy.commit()
-    print("The library goes up without an owner: the first admin to sign in gets it")
+    print(f"The library goes to {owner['email']}" if owner
+          else "The library goes up without an owner: the first admin to sign in gets it")
 
 
 async def pin(copy: sqlite3.Connection, pdf_dir: Path):
@@ -112,6 +117,7 @@ def counts(conn) -> dict:
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--owner", metavar="EMAIL", help="the account (already signed in there) to give the library to")
     parser.add_argument("--replace", action="store_true", help="delete what the Turso database holds first")
     args = parser.parse_args()
     url, token = os.environ.get("TURSO_DATABASE_URL"), os.environ.get("TURSO_AUTH_TOKEN")
@@ -127,11 +133,15 @@ def main():
         init_schema(path=path)
         copy = sqlite3.connect(path)
         drop_nuls(copy)
-        disown(copy)
+        check_one_owner(copy)
         asyncio.run(pin(copy, config.PAPERS_DIR))
 
         print(f"Connecting to {url}")
         init_schema(url=url, token=token)  # creates the tables if the database is new
+        owner = None
+        if args.owner and not (owner := db.find_user(email=args.owner.strip())):
+            sys.exit(f"No account for {args.owner} on that database: sign in to the app there first.")
+        give_to(copy, owner)
         remote = Connection(url, token)
         held = counts(remote)
         if held["papers"] or held["conversations"]:
