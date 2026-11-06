@@ -45,12 +45,13 @@ kbd { font-size: calc(11px * var(--ui-scale)); opacity: 0.7; font-family: inheri
 
 #app {
   display: grid;
-  grid-template-columns: 260px minmax(0, 1fr) 6px var(--chat-width, 440px);
+  grid-template-columns: var(--sidebar-width, 260px) minmax(0, 1fr) 6px var(--chat-width, 440px);
   height: 100vh;
 }
 
 /* Sidebar */
 #sidebar {
+  position: relative;
   background: var(--sidebar);
   border-right: 1px solid var(--border);
   display: flex;
@@ -364,6 +365,18 @@ button.analysis-pill { border: 0; cursor: pointer; font: inherit; font-size: cal
 .empty-state { max-width: 520px; margin: 12vh auto; text-align: center; padding: 0 20px; }
 .empty-state h2 { font-weight: 600; }
 
+/* Sidebar resizer: a strip over the sidebar's right edge; drag to resize, double-click to reset */
+.sidebar-resizer {
+  position: absolute; top: 0; bottom: 0; right: -4px; width: 8px; z-index: 6;
+  cursor: col-resize; touch-action: none;
+}
+.sidebar-resizer::after {
+  content: ""; position: absolute; top: 0; bottom: 0; left: 3px; width: 2px;
+  background: var(--accent); opacity: 0; transition: opacity 0.1s;
+}
+.sidebar-resizer:hover::after, .sidebar-resizer.dragging::after { opacity: 1; }
+body.resizing-sidebar { cursor: col-resize; user-select: none; }
+
 /* Resizer: drag to resize the chat, drag it nearly shut or click it to hide the chat */
 #resizer { position: relative; cursor: col-resize; touch-action: none; }
 #resizer::after { content: ""; position: absolute; inset: 0; background: var(--border); opacity: 0.4; }
@@ -418,7 +431,6 @@ button.analysis-pill { border: 0; cursor: pointer; font: inherit; font-size: cal
 /* Usage: spending on model calls, beside Settings. Its popover spans the sidebar foot. */
 .sidebar-foot { position: relative; display: flex; gap: 4px; }
 .sidebar-foot > * { flex: 1; min-width: 0; }
-.arxiv-thanks { margin: 0; padding: 0 10px 6px; color: var(--muted); font-size: calc(10.5px * var(--ui-scale)); line-height: 1.3; }
 .usage-pop { left: 8px; width: 320px; max-height: calc(100vh - 80px); overflow-y: auto; gap: 12px; }
 .usage-pop-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .usage-periods { display: flex; padding: 2px; border-radius: 7px; background: var(--bg); box-shadow: inset 0 0 0 1px var(--border); }
@@ -464,7 +476,7 @@ button.analysis-pill { border: 0; cursor: pointer; font: inherit; font-size: cal
 .budget.warning .budget-status, .budget.critical .budget-status { color: var(--text); font-weight: 600; }
 
 /* Search mode (home page): no paper is open, so the chat takes the reader's place below the topbar. */
-#app.search-mode { grid-template-columns: 260px minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
+#app.search-mode { grid-template-columns: var(--sidebar-width, 260px) minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
 #app.search-mode #sidebar { grid-row: 1 / 3; }
 #app.search-mode #main { grid-column: 2; grid-row: 1; }
 #app.search-mode #chat { grid-column: 2; grid-row: 2; }
@@ -483,7 +495,7 @@ button.analysis-pill { border: 0; cursor: pointer; font: inherit; font-size: cal
 
 /* Minimized chat: a thin strip that restores the panel when clicked */
 .chat-expand { display: none; }
-#app.chat-collapsed { grid-template-columns: 260px minmax(0, 1fr) 0 36px; }
+#app.chat-collapsed { grid-template-columns: var(--sidebar-width, 260px) minmax(0, 1fr) 0 36px; }
 #app.chat-collapsed #resizer { visibility: hidden; pointer-events: none; } /* keep its grid column */
 #app.chat-collapsed #chat > :not(.chat-expand) { display: none; }
 #app.chat-collapsed .chat-expand {
@@ -756,7 +768,7 @@ a.cite-title:hover { text-decoration: underline; }
 @media (max-width: 900px) {
   #app { grid-template-columns: 1fr; grid-template-rows: auto 50vh 0 50vh; height: auto; }
   #sidebar { max-height: 30vh; }
-  #resizer { display: none; }
+  #resizer, .sidebar-resizer { display: none; }
   .chat-head .chat-collapse { display: grid; }
   #app.chat-collapsed { grid-template-columns: 1fr; grid-template-rows: auto 1fr 0 auto; }
   #app.chat-collapsed .chat-expand { flex-direction: row; justify-content: center; padding: 8px; border-left: 0; border-top: 1px solid var(--border); }
@@ -857,6 +869,7 @@ body.signed-out #app { visibility: hidden; }
 .auth-link:hover { text-decoration: underline; }
 .auth-row { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .auth-note { font-size: calc(12px * var(--ui-scale)); }
+.auth-card .auth-thanks { margin-top: 4px; font-size: calc(11px * var(--ui-scale)); text-align: center; }
 
 /* Account: the user's initial before the title in the sidebar's head, opening a menu below it */
 .sidebar-head .brand { margin-right: auto; }

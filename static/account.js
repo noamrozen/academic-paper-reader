@@ -170,6 +170,8 @@ function showAuthPage(options, view, extra = {}) {
       location.reload();
     }));
   }
+  // arXiv asks API users to acknowledge it on their product.
+  card.append(el("p", { class: "auth-thanks muted" }, "Thank you to arXiv for use of its open access interoperability."));
   card.querySelector("[autofocus]")?.focus();
 }
 

@@ -2808,6 +2808,44 @@ function handleEvent(ev, view, status = {}) {
   dragHandle($("chat-expand"), () => { setChatCollapsed(false); $("question").focus(); });
 })();
 
+// The sidebar's right edge: drag it to resize the sidebar, double-click it to restore the default.
+(function setupSidebarResizer() {
+  const app = $("app");
+  const handle = $("sidebar-resizer");
+  const MIN = 180, MAX = 520;
+  const clamp = (w) => Math.max(MIN, Math.min(MAX, window.innerWidth - 600, w));
+  const saved = store.get("sidebarWidth", null);
+  if (saved) app.style.setProperty("--sidebar-width", `${clamp(saved)}px`);
+  handle.addEventListener("pointerdown", (e) => {
+    // Narrow screens stack the panels or make the sidebar a drawer, and hide the handle.
+    if (!e.isPrimary || e.button !== 0 || !handle.offsetParent) return;
+    e.preventDefault();
+    handle.setPointerCapture(e.pointerId);
+    const left = $("sidebar").getBoundingClientRect().left;
+    handle.classList.add("dragging");
+    document.body.classList.add("resizing-sidebar");
+    const move = (ev) => {
+      const w = Math.round(clamp(ev.clientX - left));
+      app.style.setProperty("--sidebar-width", `${w}px`);
+      store.set("sidebarWidth", w);
+    };
+    const up = () => {
+      handle.classList.remove("dragging");
+      document.body.classList.remove("resizing-sidebar");
+      handle.removeEventListener("pointermove", move);
+      handle.removeEventListener("pointerup", up);
+      handle.removeEventListener("pointercancel", up);
+    };
+    handle.addEventListener("pointermove", move);
+    handle.addEventListener("pointerup", up);
+    handle.addEventListener("pointercancel", up);
+  });
+  handle.addEventListener("dblclick", () => {
+    app.style.removeProperty("--sidebar-width");
+    store.set("sidebarWidth", null);
+  });
+})();
+
 function setChatCollapsed(collapsed) {
   $("app").classList.toggle("chat-collapsed", collapsed && !state.searchMode);
   store.set("chatCollapsed", collapsed);

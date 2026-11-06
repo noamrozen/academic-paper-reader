@@ -223,3 +223,7 @@ providers, the neutral form is used instead.
 - Default models: `claude-opus-5`, `gpt-5`, `gemini-3.8-flash`, `deepseek/deepseek-v4.1-flash` (OpenRouter). Override them in `.env`. The model field lists whatever models your key can access.
 - OpenRouter reserves credit for the full output limit up front, so requests are capped at `OPENROUTER_MAX_TOKENS` (default 16384, reasoning included). Lower it if you get 402 errors on a small balance.
 - On Claude Opus 5 / Fable, server-side refusal fallback (`fallbacks: "default"`) is enabled.
+
+## Acknowledgments
+
+Thank you to arXiv for use of its open access interoperability.
